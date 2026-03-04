@@ -12,64 +12,111 @@ const wss = new WebSocket.Server({ server });
 
 let clients = [];
 
-wss.on('connection', function connection(ws) {
+wss.on('connection', (ws) => {
     const player = {
         id: Date.now(),
         x: 0,
         y: 0,
-        name: "User_" + Date.now().toString().slice(-4)  // ← вот здесь имя, типа User_4567
+        name: "User_" + Date.now().toString().slice(-4)
     };
 
     clients.push({ ws, player });
 
-    console.log(player.name + ' connected');
+    console.log(`[${player.name}] подключился (ID: ${player.id})`);
 
-    ws.on('message', function incoming(message) {
+    // Отправляем новому клиенту текущее состояние всех игроков
+    ws.send(JSON.stringify({
+        type: "update",
+        players: clients.map(c => ({
+            id: c.player.id,
+            name: c.player.name,
+            x: c.player.x,
+            y: c.player.y
+        }))
+    }));
+
+    ws.on('message', (message) => {
         try {
-            const data = JSON.parse(message);
+            const data = JSON.parse(message.toString());
 
+            // Обработка движения
             if (data.type === "move") {
                 player.x = data.x;
                 player.y = data.y;
+
+                // Рассылаем обновление всем (кроме отправителя, чтобы не дублировать)
+                broadcast({
+                    type: "update",
+                    players: clients.map(c => ({
+                        id: c.player.id,
+                        name: c.player.name,
+                        x: c.player.x,
+                        y: c.player.y
+                    }))
+                }, ws);
             }
 
+            // Обработка чата
             if (data.type === "chat") {
-                // Отправляем всем с именем отправителя
                 const chatMsg = {
                     type: "chat",
                     id: player.id,
-                    name: player.name,          // ← имя здесь
+                    name: player.name,
                     text: data.text
                 };
                 broadcast(chatMsg);
             }
 
-            // Отправляем обновление всех игроков (пока можно оставить, потом уберём если не нужно)
-            broadcast({
-                type: "update",
-                players: clients.map(c => ({ id: c.player.id, name: c.player.name, x: c.player.x, y: c.player.y }))
-            });
+            // Обработка WebRTC signaling (offer, answer, ICE candidates)
+            if (data.type.startsWith("webrtc_")) {
+                const targetId = data.targetId;
+                const fromId = player.id;
+                const payload = data.payload;
+
+                const targetClient = clients.find(c => c.player.id === targetId);
+                if (targetClient) {
+                    targetClient.ws.send(JSON.stringify({
+                        type: data.type,
+                        fromId: fromId,
+                        payload: payload
+                    }));
+                    console.log(`WebRTC ${data.type} от ${fromId} → ${targetId}`);
+                } else {
+                    console.log(`Целевой клиент ${targetId} не найден`);
+                }
+            }
 
         } catch (e) {
-            console.log('Invalid JSON:', message);
+            console.log(`Ошибка парсинга от ${player.name}:`, e.message);
         }
     });
 
-    ws.on('close', function () {
-        console.log(player.name + ' disconnected');
+    ws.on('close', () => {
+        console.log(`[${player.name}] отключился`);
         clients = clients.filter(c => c.ws !== ws);
+
+        // Рассылаем обновление всем после отключения
+        broadcast({
+            type: "update",
+            players: clients.map(c => ({
+                id: c.player.id,
+                name: c.player.name,
+                x: c.player.x,
+                y: c.player.y
+            }))
+        });
     });
 });
 
-function broadcast(data) {
+function broadcast(data, excludeWs = null) {
     const msg = JSON.stringify(data);
-    clients.forEach(c => {
-        if (c.ws.readyState === WebSocket.OPEN) {
-            c.ws.send(msg);
+    clients.forEach(client => {
+        if (client.ws.readyState === WebSocket.OPEN && client.ws !== excludeWs) {
+            client.ws.send(msg);
         }
     });
 }
 
 server.listen(PORT, () => {
-    console.log("Server running on port", PORT);
+    console.log(`Сервер запущен на порту ${PORT}`);
 });
