@@ -24,7 +24,6 @@ wss.on('connection', (ws) => {
 
     console.log(`[${player.name}] подключился (ID: ${player.id})`);
 
-    // Отправляем новому клиенту текущее состояние всех игроков
     ws.send(JSON.stringify({
         type: "update",
         players: clients.map(c => ({
@@ -39,12 +38,10 @@ wss.on('connection', (ws) => {
         try {
             const data = JSON.parse(message.toString());
 
-            // Обработка движения
             if (data.type === "move") {
                 player.x = data.x;
                 player.y = data.y;
 
-                // Рассылаем обновление всем (кроме отправителя, чтобы не дублировать)
                 broadcast({
                     type: "update",
                     players: clients.map(c => ({
@@ -56,7 +53,6 @@ wss.on('connection', (ws) => {
                 }, ws);
             }
 
-            // Обработка чата
             if (data.type === "chat") {
                 const chatMsg = {
                     type: "chat",
@@ -67,22 +63,18 @@ wss.on('connection', (ws) => {
                 broadcast(chatMsg);
             }
 
-            // Обработка WebRTC signaling (offer, answer, ICE candidates)
             if (data.type.startsWith("webrtc_")) {
                 const targetId = data.targetId;
                 const fromId = player.id;
-                const payload = data.payload;
 
                 const targetClient = clients.find(c => c.player.id === targetId);
                 if (targetClient) {
                     targetClient.ws.send(JSON.stringify({
                         type: data.type,
                         fromId: fromId,
-                        payload: payload
+                        payload: data.payload
                     }));
                     console.log(`WebRTC ${data.type} от ${fromId} → ${targetId}`);
-                } else {
-                    console.log(`Целевой клиент ${targetId} не найден`);
                 }
             }
 
@@ -95,7 +87,6 @@ wss.on('connection', (ws) => {
         console.log(`[${player.name}] отключился`);
         clients = clients.filter(c => c.ws !== ws);
 
-        // Рассылаем обновление всем после отключения
         broadcast({
             type: "update",
             players: clients.map(c => ({
