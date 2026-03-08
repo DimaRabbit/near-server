@@ -10,7 +10,8 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-let clients = [];
+let clients = []; // { ws, player: {id, name, x, y} }
+let rooms = new Map(); // roomId → { name, members: [playerId], messages: [] }
 
 wss.on('connection', (ws) => {
     const player = {
@@ -22,16 +23,12 @@ wss.on('connection', (ws) => {
 
     clients.push({ ws, player });
 
-    console.log(`[${player.name}] подключился (ID: ${player.id})`);
+    console.log(`[${player.name}] подключился`);
 
+    // Отправляем новому клиенту текущее состояние
     ws.send(JSON.stringify({
         type: "update",
-        players: clients.map(c => ({
-            id: c.player.id,
-            name: c.player.name,
-            x: c.player.x,
-            y: c.player.y
-        }))
+        players: clients.map(c => ({ id: c.player.id, name: c.player.name, x: c.player.x, y: c.player.y }))
     }));
 
     ws.on('message', (message) => {
@@ -42,44 +39,86 @@ wss.on('connection', (ws) => {
                 player.x = data.x;
                 player.y = data.y;
 
-                broadcast({
+                broadcastToRoom("global", {
                     type: "update",
-                    players: clients.map(c => ({
-                        id: c.player.id,
-                        name: c.player.name,
-                        x: c.player.x,
-                        y: c.player.y
-                    }))
-                }, ws);
+                    players: clients.map(c => ({ id: c.player.id, name: c.player.name, x: c.player.x, y: c.player.y }))
+                });
             }
 
             if (data.type === "chat") {
+                const roomId = data.roomId || "global";
                 const chatMsg = {
                     type: "chat",
+                    roomId: roomId,
                     id: player.id,
                     name: player.name,
-                    text: data.text
+                    text: data.text,
+                    timestamp: Date.now()
                 };
-                broadcast(chatMsg);
+
+                // Сохраняем в комнату
+                if (!rooms.has(roomId)) {
+                    rooms.set(roomId, { name: roomId, members: [player.id], messages: [] });
+                }
+                rooms.get(roomId).messages.push(chatMsg);
+
+                // Отправляем только участникам комнаты
+                broadcastToRoom(roomId, chatMsg);
             }
 
-            if (data.type.startsWith("webrtc_")) {
+            // Создание/присоединение к комнате
+            if (data.type === "create_room") {
+                const roomId = "room_" + Date.now();
+                rooms.set(roomId, { name: data.name || roomId, members: [player.id], messages: [] });
+
+                ws.send(JSON.stringify({
+                    type: "room_created",
+                    roomId: roomId,
+                    name: data.name || roomId
+                }));
+            }
+
+            if (data.type === "join_room") {
+                const roomId = data.roomId;
+                if (rooms.has(roomId)) {
+                    const room = rooms.get(roomId);
+                    if (!room.members.includes(player.id)) {
+                        room.members.push(player.id);
+                    }
+
+                    // Отправляем историю комнаты новому участнику
+                    ws.send(JSON.stringify({
+                        type: "room_history",
+                        roomId: roomId,
+                        messages: room.messages
+                    }));
+
+                    broadcastToRoom(roomId, {
+                        type: "room_update",
+                        roomId: roomId,
+                        members: room.members
+                    });
+                }
+            }
+
+            // Приглашение в комнату
+            if (data.type === "invite_to_room") {
                 const targetId = data.targetId;
-                const fromId = player.id;
+                const roomId = data.roomId;
 
                 const targetClient = clients.find(c => c.player.id === targetId);
                 if (targetClient) {
                     targetClient.ws.send(JSON.stringify({
-                        type: data.type,
-                        fromId: fromId,
-                        payload: data.payload
+                        type: "room_invite",
+                        fromId: player.id,
+                        fromName: player.name,
+                        roomId: roomId
                     }));
-                    console.log(`WebRTC ${data.type} от ${fromId} → ${targetId}`);
                 }
             }
 
         } catch (e) {
-            console.log(`Ошибка парсинга от ${player.name}:`, e.message);
+            console.log(`Ошибка от ${player.name}:`, e.message);
         }
     });
 
@@ -87,25 +126,35 @@ wss.on('connection', (ws) => {
         console.log(`[${player.name}] отключился`);
         clients = clients.filter(c => c.ws !== ws);
 
-        broadcast({
+        // Удаляем из всех комнат
+        for (const [roomId, room] of rooms) {
+            room.members = room.members.filter(id => id !== player.id);
+            if (room.members.length === 0) rooms.delete(roomId);
+        }
+
+        broadcastToRoom("global", {
             type: "update",
-            players: clients.map(c => ({
-                id: c.player.id,
-                name: c.player.name,
-                x: c.player.x,
-                y: c.player.y
-            }))
+            players: clients.map(c => ({ id: c.player.id, name: c.player.name, x: c.player.x, y: c.player.y }))
         });
     });
 });
 
-function broadcast(data, excludeWs = null) {
+function broadcastToRoom(roomId, data) {
     const msg = JSON.stringify(data);
-    clients.forEach(client => {
-        if (client.ws.readyState === WebSocket.OPEN && client.ws !== excludeWs) {
-            client.ws.send(msg);
-        }
-    });
+    const room = rooms.get(roomId);
+    if (room) {
+        clients.forEach(client => {
+            if (room.members.includes(client.player.id) && client.ws.readyState === WebSocket.OPEN) {
+                client.ws.send(msg);
+            }
+        });
+    } else if (roomId === "global") {
+        clients.forEach(client => {
+            if (client.ws.readyState === WebSocket.OPEN) {
+                client.ws.send(msg);
+            }
+        });
+    }
 }
 
 server.listen(PORT, () => {
