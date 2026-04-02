@@ -1,303 +1,198 @@
-const WebSocket = require('ws');
 const http = require('http');
+const WebSocket = require('ws');
 
-const server = http.createServer();
+const PORT = process.env.PORT || 10000;
+
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('NEAR Server Running');
+});
+
 const wss = new WebSocket.Server({ server });
 
-const clients = new Map();      // id → ws
-const rooms = {};               // roomId → {name, creatorId, members: [], pendingJoins: [], private: true}
+let clients = [];                    // [{ ws, player }]
+let rooms = new Map();               // roomId → { name, creatorId, members: [id, ...] }
 
 let nextPlayerId = 1;
 
 wss.on('connection', (ws) => {
-    const id = nextPlayerId++;
-    ws.id = id;
-    ws.name = `User_${id.toString().slice(-4)}`;
-    clients.set(id, ws);
+    const player = {
+        id: nextPlayerId++,
+        name: `User_${(nextPlayerId-1).toString().slice(-4)}`,
+        roomId: "global"
+    };
 
-    console.log(`[${ws.name}] Подключился (id: ${id})`);
+    clients.push({ ws, player });
 
-    // Отправляем новому клиенту его данные
+    console.log(`[${player.name}] подключился`);
+
+    // Отправляем информацию о себе
     ws.send(JSON.stringify({
-        type: 'self_info',
-        id: id,
-        name: ws.name
+        type: "self_info",
+        id: player.id,
+        name: player.name
     }));
 
-    // Отправляем обновление игроков всем
     broadcastPlayersUpdate();
 
     ws.on('message', (message) => {
         try {
-            const data = JSON.parse(message.toString());
+            const data = JSON.parse(message);
 
             switch (data.type) {
-                case 'chat':
-                    handleChat(ws, data);
+
+                case "create_room":
+                    handleCreateRoom(ws, player, data);
                     break;
 
-                case 'move':
-                    handleMove(ws, data);
+                case "request_join":
+                    handleRequestJoin(ws, player, data);
                     break;
 
-                case 'create_room':
-                    handleCreateRoom(ws, data);
+                case "approve_join":
+                    handleApproveJoin(ws, player, data);
                     break;
 
-                case 'join_room':
-                    handleJoinRoom(ws, data);
+                case "chat":
+                    handleChat(ws, player, data);
                     break;
 
-                case 'approve_join':
-                    handleApproveJoin(ws, data);
+                case "move":
+                    player.x = data.x;
+                    player.y = data.y;
                     break;
-
-                default:
-                    console.log(`Неизвестный тип: ${data.type}`);
             }
         } catch (e) {
-            console.error('Ошибка парсинга:', e);
+            console.error("Ошибка парсинга сообщения:", e);
         }
     });
 
     ws.on('close', () => {
-        console.log(`[${ws.name}] Отключился`);
-        clients.delete(id);
+        console.log(`[${player.name}] отключился`);
+        clients = clients.filter(c => c.ws !== ws);
 
-        // Удаляем из всех комнат
-        for (const roomId in rooms) {
-            const room = rooms[roomId];
-            room.members = room.members.filter(m => m !== id);
-            room.pendingJoins = room.pendingJoins.filter(m => m !== id);
-
-            if (room.creatorId === id) {
-                // Если создатель вышел — удаляем комнату или передаём права (здесь просто удаляем)
-                delete rooms[roomId];
-                console.log(`Комната ${roomId} удалена (создатель вышел)`);
+        // Удаляем игрока из всех комнат
+        rooms.forEach((room, roomId) => {
+            room.members = room.members.filter(id => id !== player.id);
+            if (room.creatorId === player.id) {
+                rooms.delete(roomId);
             }
-
-            broadcastRoomUpdate(roomId);
-        }
+        });
 
         broadcastPlayersUpdate();
     });
 });
 
-// ────────────────────────────────────────────────
-// Вспомогательные функции
-// ────────────────────────────────────────────────
+// ====================== ОБРАБОТЧИКИ ======================
 
-function broadcastPlayersUpdate() {
-    const players = [];
-    clients.forEach((ws, id) => {
-        players.push({
-            id,
-            name: ws.name,
-            x: ws.x || 0,
-            y: ws.y || 0
-        });
+function handleCreateRoom(ws, player, data) {
+    const roomId = "room_" + Date.now();
+    rooms.set(roomId, {
+        name: data.name || "Private Room",
+        creatorId: player.id,
+        members: [player.id]
     });
 
-    const msg = JSON.stringify({
-        type: 'update',
-        players
-    });
-
-    clients.forEach(ws => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(msg);
-        }
-    });
-}
-
-function handleChat(ws, data) {
-    const roomId = data.roomId || 'global';
-    const msg = {
-        type: 'chat',
-        roomId,
-        id: ws.id,
-        name: ws.name,
-        text: data.text,
-        timestamp: Date.now()
-    };
-
-    if (roomId === 'global') {
-        // глобальный чат — всем
-        clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify(msg));
-            }
-        });
-    } else {
-        // приватная комната — только членам
-        const room = rooms[roomId];
-        if (room && room.members.includes(ws.id)) {
-            room.members.forEach(memberId => {
-                const client = clients.get(memberId);
-                if (client && client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify(msg));
-                }
-            });
-        }
-    }
-
-    console.log(`Чат [${roomId}]: ${ws.name} → ${data.text}`);
-}
-
-function handleMove(ws, data) {
-    ws.x = data.x;
-    ws.y = data.y;
-    // Обновление позиций рассылается в broadcastPlayersUpdate каждые 100–200 мс (таймер ниже)
-}
-
-function handleCreateRoom(ws, data) {
-    const roomId = 'room_' + Date.now();
-
-    rooms[roomId] = {
-        name: data.name || 'Без названия',
-        creatorId: ws.id,
-        members: [ws.id],
-        pendingJoins: [],
-        private: true
-    };
+    player.roomId = roomId;
 
     ws.send(JSON.stringify({
-        type: 'room_created',
-        roomId,
-        name: rooms[roomId].name
+        type: "room_created",
+        roomId: roomId,
+        name: rooms.get(roomId).name
     }));
 
-    console.log(`Создана комната: ${rooms[roomId].name} (${roomId}) создателем ${ws.name}`);
-
-    // Можно сразу отправить историю (пока пустая)
-    ws.send(JSON.stringify({
-        type: 'room_history',
-        roomId,
-        messages: []
-    }));
-
-    broadcastRoomUpdate(roomId);
+    console.log(`[${player.name}] создал комнату ${roomId}`);
 }
 
-function handleJoinRoom(ws, data) {
-    const roomId = data.roomId;
-    const room = rooms[roomId];
+function handleRequestJoin(ws, player, data) {
+    const room = rooms.get(data.roomId);
+    if (!room) return;
 
-    if (!room) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Комната не найдена' }));
-        return;
-    }
-
-    if (room.members.includes(ws.id)) {
-        ws.send(JSON.stringify({ type: 'join_success', roomId }));
-        ws.send(JSON.stringify({
-            type: 'room_history',
-            roomId,
-            messages: [] // здесь можно хранить историю сообщений комнаты
-        }));
-        return;
-    }
-
-    if (!room.private) {
-        room.members.push(ws.id);
-        ws.send(JSON.stringify({ type: 'join_success', roomId }));
-        broadcastRoomUpdate(roomId);
-        return;
-    }
-
-    // Приватная — запрос создателю
-    const creator = clients.get(room.creatorId);
-    if (creator && creator.readyState === WebSocket.OPEN) {
-        creator.send(JSON.stringify({
-            type: 'join_request',
-            roomId,
-            userId: ws.id,
-            userName: ws.name
+    // Находим создателя комнаты
+    const creator = clients.find(c => c.player.id === room.creatorId);
+    if (creator) {
+        creator.ws.send(JSON.stringify({
+            type: "room_invite",
+            fromId: player.id,
+            fromName: player.name,
+            roomId: data.roomId
         }));
     }
 
-    room.pendingJoins.push(ws.id);
-
-    ws.send(JSON.stringify({
-        type: 'join_pending',
-        message: 'Запрос на вступление отправлен создателю'
-    }));
-
-    console.log(`[${ws.name}] запросил вступление в приватную комнату ${room.name} (${roomId})`);
+    console.log(`[${player.name}] запросил вступление в комнату ${data.roomId}`);
 }
 
-function handleApproveJoin(ws, data) {
-    const room = rooms[data.roomId];
-    if (!room || room.creatorId !== ws.id) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Нет прав или комната не найдена' }));
-        return;
-    }
+function handleApproveJoin(ws, player, data) {
+    const room = rooms.get(data.roomId);
+    if (!room || room.creatorId !== player.id) return;
 
-    const userId = data.userId;
+    const targetId = parseInt(data.userId);
     const approved = !!data.approved;
 
     if (approved) {
-        if (room.pendingJoins.includes(userId)) {
-            room.members.push(userId);
-            room.pendingJoins = room.pendingJoins.filter(id => id !== userId);
-
-            const target = clients.get(userId);
-            if (target && target.readyState === WebSocket.OPEN) {
-                target.send(JSON.stringify({
-                    type: 'join_approved',
-                    roomId: data.roomId,
-                    roomName: room.name
-                }));
-                // Можно сразу отправить историю комнаты
-                target.send(JSON.stringify({
-                    type: 'room_history',
-                    roomId: data.roomId,
-                    messages: [] // если хранишь историю
-                }));
-            }
-
-            broadcastRoomUpdate(data.roomId);
-            console.log(`[${ws.name}] одобрил вступление ${clients.get(userId)?.name || userId} в ${room.name}`);
+        if (!room.members.includes(targetId)) {
+            room.members.push(targetId);
         }
-    } else {
-        const target = clients.get(userId);
-        if (target && target.readyState === WebSocket.OPEN) {
-            target.send(JSON.stringify({
-                type: 'join_denied',
-                roomId: data.roomId,
-                message: data.reason || 'Вступление отклонено создателем'
+
+        const targetClient = clients.find(c => c.player.id === targetId);
+        if (targetClient) {
+            targetClient.player.roomId = data.roomId;
+            targetClient.ws.send(JSON.stringify({
+                type: "join_approved",
+                roomId: data.roomId
             }));
         }
-
-        room.pendingJoins = room.pendingJoins.filter(id => id !== userId);
-        console.log(`[${ws.name}] отклонил вступление ${clients.get(userId)?.name || userId} в ${room.name}`);
+        console.log(`[${player.name}] одобрил вход игрока ${targetId} в комнату ${data.roomId}`);
+    } else {
+        const targetClient = clients.find(c => c.player.id === targetId);
+        if (targetClient) {
+            targetClient.ws.send(JSON.stringify({
+                type: "join_denied",
+                roomId: data.roomId,
+                message: "Запрос отклонён"
+            }));
+        }
     }
 }
 
-function broadcastRoomUpdate(roomId) {
-    const room = rooms[roomId];
-    if (!room) return;
+function handleChat(ws, player, data) {
+    const roomId = player.roomId || "global";
 
-    const payload = {
-        type: 'room_update',
-        roomId,
-        members: room.members.map(id => ({
-            id,
-            name: clients.get(id)?.name || '???'
-        }))
+    const msg = {
+        type: "chat",
+        name: player.name,
+        text: data.text,
+        roomId: roomId
     };
 
-    room.members.forEach(memberId => {
-        const ws = clients.get(memberId);
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(payload));
+    // Отправляем только участникам текущей комнаты
+    clients.forEach(client => {
+        if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(JSON.stringify(msg));
         }
     });
 }
 
-// Каждые 150 мс рассылаем позиции игроков
+function broadcastPlayersUpdate() {
+    const players = clients.map(c => ({
+        id: c.player.id,
+        name: c.player.name,
+        x: c.player.x || 0,
+        y: c.player.y || 0
+    }));
+
+    const msg = JSON.stringify({ type: "update", players });
+
+    clients.forEach(client => {
+        if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(msg);
+        }
+    });
+}
+
+// Обновление позиций каждые 150 мс
 setInterval(broadcastPlayersUpdate, 150);
 
-server.listen(8080, () => {
-    console.log('WebSocket сервер запущен на ws://localhost:8080');
+server.listen(PORT, () => {
+    console.log(`NEAR Server запущен на порту ${PORT}`);
 });
