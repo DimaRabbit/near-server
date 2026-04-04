@@ -10,8 +10,8 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-let clients = [];           // [{ ws, player }]
-let rooms = new Map();      // roomId → { name, creatorId, members: [] }
+let clients = [];
+let rooms = new Map();
 let nextPlayerId = 1;
 
 wss.on('connection', (ws) => {
@@ -25,7 +25,7 @@ wss.on('connection', (ws) => {
 
     clients.push({ ws, player });
 
-    console.log(`[${player.name}] подключился`);
+    console.log(`[${player.name}] подключился (id=${player.id})`);
 
     ws.send(JSON.stringify({
         type: "self_info",
@@ -99,9 +99,12 @@ function handleCreateRoom(ws, player, data) {
 
 function handleRequestJoin(ws, player, data) {
     const room = rooms.get(data.roomId);
-    if (!room) return;
+    if (!room) {
+        console.log(`Комната ${data.roomId} не найдена`);
+        return;
+    }
 
-    // НАХОДИМ СОЗДАТЕЛЯ и отправляем ему invite
+    // Отправляем invite СОЗДАТЕЛЮ комнаты
     const creatorClient = clients.find(c => c.player.id === room.creatorId);
 
     if (creatorClient && creatorClient.ws.readyState === WebSocket.OPEN) {
@@ -111,7 +114,7 @@ function handleRequestJoin(ws, player, data) {
             fromName: player.name,
             roomId: data.roomId
         }));
-        console.log(`Invite отправлен создателю (id=${room.creatorId}) от ${player.name}`);
+        console.log(`[${player.name}] запросил вход → invite отправлен создателю (id=${room.creatorId})`);
     } else {
         console.log(`Создатель комнаты ${data.roomId} не найден`);
     }
@@ -135,7 +138,7 @@ function handleApproveJoin(ws, player, data) {
                 roomId: data.roomId
             }));
         }
-        console.log(`[${player.name}] одобрил вход ${targetId}`);
+        console.log(`[${player.name}] одобрил вход игрока ${targetId}`);
     } else {
         const targetClient = clients.find(c => c.player.id === targetId);
         if (targetClient) {
