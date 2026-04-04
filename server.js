@@ -10,16 +10,17 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-let clients = [];                    // [{ ws, player }]
-let rooms = new Map();               // roomId → { name, creatorId, members: [id, ...] }
-
+let clients = [];           // [{ ws, player }]
+let rooms = new Map();      // roomId → { name, creatorId, members: [id, ...] }
 let nextPlayerId = 1;
 
 wss.on('connection', (ws) => {
     const player = {
         id: nextPlayerId++,
-        name: `User_${(nextPlayerId-1).toString().slice(-4)}`,
-        roomId: "global"
+        name: `User_${(nextPlayerId - 1).toString().slice(-4)}`,
+        roomId: "global",
+        x: 0,
+        y: 0
     };
 
     clients.push({ ws, player });
@@ -40,26 +41,21 @@ wss.on('connection', (ws) => {
             const data = JSON.parse(message);
 
             switch (data.type) {
-
                 case "create_room":
                     handleCreateRoom(ws, player, data);
                     break;
-
                 case "request_join":
                     handleRequestJoin(ws, player, data);
                     break;
-
                 case "approve_join":
                     handleApproveJoin(ws, player, data);
                     break;
-
                 case "chat":
                     handleChat(ws, player, data);
                     break;
-
                 case "move":
-                    player.x = data.x;
-                    player.y = data.y;
+                    player.x = data.x || 0;
+                    player.y = data.y || 0;
                     break;
             }
         } catch (e) {
@@ -71,7 +67,7 @@ wss.on('connection', (ws) => {
         console.log(`[${player.name}] отключился`);
         clients = clients.filter(c => c.ws !== ws);
 
-        // Удаляем игрока из всех комнат
+        // Удаляем из комнат
         rooms.forEach((room, roomId) => {
             room.members = room.members.filter(id => id !== player.id);
             if (room.creatorId === player.id) {
@@ -87,6 +83,7 @@ wss.on('connection', (ws) => {
 
 function handleCreateRoom(ws, player, data) {
     const roomId = "room_" + Date.now();
+
     rooms.set(roomId, {
         name: data.name || "Private Room",
         creatorId: player.id,
@@ -106,20 +103,25 @@ function handleCreateRoom(ws, player, data) {
 
 function handleRequestJoin(ws, player, data) {
     const room = rooms.get(data.roomId);
-    if (!room) return;
+    if (!room) {
+        console.log(`Комната ${data.roomId} не найдена`);
+        return;
+    }
 
-    // Находим создателя комнаты
-    const creator = clients.find(c => c.player.id === room.creatorId);
-    if (creator) {
-        creator.ws.send(JSON.stringify({
+    // Отправляем invite ТОЛЬКО создателю комнаты
+    const creatorClient = clients.find(c => c.player.id === room.creatorId);
+
+    if (creatorClient && creatorClient.ws.readyState === WebSocket.OPEN) {
+        creatorClient.ws.send(JSON.stringify({
             type: "room_invite",
             fromId: player.id,
             fromName: player.name,
             roomId: data.roomId
         }));
+        console.log(`[${player.name}] запросил вход в комнату ${data.roomId} → отправлено создателю`);
+    } else {
+        console.log(`Создатель комнаты ${data.roomId} не найден`);
     }
-
-    console.log(`[${player.name}] запросил вступление в комнату ${data.roomId}`);
 }
 
 function handleApproveJoin(ws, player, data) {
@@ -149,7 +151,7 @@ function handleApproveJoin(ws, player, data) {
             targetClient.ws.send(JSON.stringify({
                 type: "join_denied",
                 roomId: data.roomId,
-                message: "Запрос отклонён"
+                message: "Запрос отклонён создателем"
             }));
         }
     }
@@ -165,7 +167,7 @@ function handleChat(ws, player, data) {
         roomId: roomId
     };
 
-    // Отправляем только участникам текущей комнаты
+    // Отправляем только участникам этой комнаты
     clients.forEach(client => {
         if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
             client.ws.send(JSON.stringify(msg));
@@ -174,14 +176,14 @@ function handleChat(ws, player, data) {
 }
 
 function broadcastPlayersUpdate() {
-    const players = clients.map(c => ({
+    const playersData = clients.map(c => ({
         id: c.player.id,
         name: c.player.name,
         x: c.player.x || 0,
         y: c.player.y || 0
     }));
 
-    const msg = JSON.stringify({ type: "update", players });
+    const msg = JSON.stringify({ type: "update", players: playersData });
 
     clients.forEach(client => {
         if (client.ws.readyState === WebSocket.OPEN) {
