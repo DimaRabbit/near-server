@@ -38,6 +38,7 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
+            console.log(`[${player.name}] получил сообщение:`, data.type);
 
             switch (data.type) {
                 case "create_room":
@@ -82,7 +83,7 @@ function handleCreateRoom(ws, player, data) {
 
     rooms.set(roomId, {
         name: data.name || "Private Room",
-        creatorId: player.id,
+        creatorId: player.id,        // ← важно!
         members: [player.id]
     });
 
@@ -94,7 +95,7 @@ function handleCreateRoom(ws, player, data) {
         name: rooms.get(roomId).name
     }));
 
-    console.log(`[${player.name}] создал комнату ${roomId}`);
+    console.log(`[${player.name}] создал комнату ${roomId} (creatorId=${player.id})`);
 }
 
 function handleRequestJoin(ws, player, data) {
@@ -104,7 +105,9 @@ function handleRequestJoin(ws, player, data) {
         return;
     }
 
-    // Отправляем invite СОЗДАТЕЛЮ комнаты
+    console.log(`[${player.name}] запросил вход в комнату ${data.roomId}. Создатель = ${room.creatorId}`);
+
+    // Отправляем invite создателю
     const creatorClient = clients.find(c => c.player.id === room.creatorId);
 
     if (creatorClient && creatorClient.ws.readyState === WebSocket.OPEN) {
@@ -114,9 +117,9 @@ function handleRequestJoin(ws, player, data) {
             fromName: player.name,
             roomId: data.roomId
         }));
-        console.log(`[${player.name}] запросил вход → invite отправлен создателю (id=${room.creatorId})`);
+        console.log(`→ Invite успешно отправлен создателю (id=${room.creatorId})`);
     } else {
-        console.log(`Создатель комнаты ${data.roomId} не найден`);
+        console.log(`→ Создатель комнаты не найден!`);
     }
 }
 
@@ -139,15 +142,6 @@ function handleApproveJoin(ws, player, data) {
             }));
         }
         console.log(`[${player.name}] одобрил вход игрока ${targetId}`);
-    } else {
-        const targetClient = clients.find(c => c.player.id === targetId);
-        if (targetClient) {
-            targetClient.ws.send(JSON.stringify({
-                type: "join_denied",
-                roomId: data.roomId,
-                message: "Запрос отклонён"
-            }));
-        }
     }
 }
 
