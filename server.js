@@ -38,7 +38,7 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log(`[${player.name}] получил сообщение:`, data.type);
+            console.log(`[${player.name}] → ${data.type}`);
 
             switch (data.type) {
                 case "create_room":
@@ -83,7 +83,7 @@ function handleCreateRoom(ws, player, data) {
 
     rooms.set(roomId, {
         name: data.name || "Private Room",
-        creatorId: player.id,        // ← важно!
+        creatorId: player.id,           // ← сохраняем создателя
         members: [player.id]
     });
 
@@ -95,7 +95,7 @@ function handleCreateRoom(ws, player, data) {
         name: rooms.get(roomId).name
     }));
 
-    console.log(`[${player.name}] создал комнату ${roomId} (creatorId=${player.id})`);
+    console.log(`[${player.name}] создал комнату ${roomId} (creator=${player.id})`);
 }
 
 function handleRequestJoin(ws, player, data) {
@@ -105,21 +105,19 @@ function handleRequestJoin(ws, player, data) {
         return;
     }
 
-    console.log(`[${player.name}] запросил вход в комнату ${data.roomId}. Создатель = ${room.creatorId}`);
-
-    // Отправляем invite создателю
+    // Ищем создателя по creatorId
     const creatorClient = clients.find(c => c.player.id === room.creatorId);
 
     if (creatorClient && creatorClient.ws.readyState === WebSocket.OPEN) {
         creatorClient.ws.send(JSON.stringify({
             type: "room_invite",
-            fromId: player.id,
+            fromId: player.id,           // кто запрашивает
             fromName: player.name,
             roomId: data.roomId
         }));
-        console.log(`→ Invite успешно отправлен создателю (id=${room.creatorId})`);
+        console.log(`Invite отправлен создателю (id=${room.creatorId}) от ${player.name}`);
     } else {
-        console.log(`→ Создатель комнаты не найден!`);
+        console.log(`Создатель комнаты ${data.roomId} не найден`);
     }
 }
 
@@ -141,7 +139,7 @@ function handleApproveJoin(ws, player, data) {
                 roomId: data.roomId
             }));
         }
-        console.log(`[${player.name}] одобрил вход игрока ${targetId}`);
+        console.log(`[${player.name}] одобрил вход ${targetId}`);
     }
 }
 
