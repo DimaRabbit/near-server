@@ -25,8 +25,9 @@ wss.on('connection', (ws) => {
 
     clients.push({ ws, player });
 
-    console.log(`[${player.name}] подключился (id=${player.id})`);
+    console.log(`[${player.name}] (id=${player.id}) подключился`);
 
+    // Отправляем информацию о себе
     ws.send(JSON.stringify({
         type: "self_info",
         id: player.id,
@@ -38,7 +39,7 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log(`[${player.name}] → ${data.type}`);
+            console.log(`[${player.name}] получил: ${data.type}`);
 
             switch (data.type) {
                 case "create_room":
@@ -83,7 +84,7 @@ function handleCreateRoom(ws, player, data) {
 
     rooms.set(roomId, {
         name: data.name || "Private Room",
-        creatorId: player.id,           // ← сохраняем создателя
+        creatorId: player.id,
         members: [player.id]
     });
 
@@ -95,7 +96,7 @@ function handleCreateRoom(ws, player, data) {
         name: rooms.get(roomId).name
     }));
 
-    console.log(`[${player.name}] создал комнату ${roomId} (creator=${player.id})`);
+    console.log(`[${player.name}] создал комнату ${roomId} (creator = ${player.id})`);
 }
 
 function handleRequestJoin(ws, player, data) {
@@ -105,19 +106,19 @@ function handleRequestJoin(ws, player, data) {
         return;
     }
 
-    // Ищем создателя по creatorId
+    // Ищем клиента-создателя по ID
     const creatorClient = clients.find(c => c.player.id === room.creatorId);
 
     if (creatorClient && creatorClient.ws.readyState === WebSocket.OPEN) {
         creatorClient.ws.send(JSON.stringify({
             type: "room_invite",
-            fromId: player.id,           // кто запрашивает
+            fromId: player.id,
             fromName: player.name,
             roomId: data.roomId
         }));
-        console.log(`Invite отправлен создателю (id=${room.creatorId}) от ${player.name}`);
+        console.log(`[${player.name}] запросил вход → invite отправлен СОЗДАТЕЛЮ (id=${room.creatorId})`);
     } else {
-        console.log(`Создатель комнаты ${data.roomId} не найден`);
+        console.log(`Не удалось найти создателя комнаты ${data.roomId}`);
     }
 }
 
@@ -139,7 +140,7 @@ function handleApproveJoin(ws, player, data) {
                 roomId: data.roomId
             }));
         }
-        console.log(`[${player.name}] одобрил вход ${targetId}`);
+        console.log(`[${player.name}] одобрил вход игрока ${targetId}`);
     }
 }
 
