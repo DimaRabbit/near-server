@@ -24,36 +24,36 @@ wss.on('connection', (ws) => {
     };
 
     clients.push({ ws, player });
-
     console.log(`[${player.name}] (id=${player.id}) подключился`);
 
-    // Отправляем информацию о себе
-    ws.send(JSON.stringify({
-        type: "self_info",
-        id: player.id,
-        name: player.name
-    }));
-
+    ws.send(JSON.stringify({ type: "self_info", id: player.id, name: player.name }));
     broadcastPlayersUpdate();
 
-    ws.on('message', (message) => {
+    ws.on('message', (message, isBinary) => {
+        // --- ГОЛОС: бинарный кадр от клиента [int32 sampleRate][int16 PCM...] ---
+        if (isBinary) {
+            const header = Buffer.alloc(4);
+            header.writeInt32LE(player.id, 0);          // подставляем id отправителя
+            const out = Buffer.concat([header, message]); // -> [id][sampleRate][PCM]
+            const roomId = player.roomId || "global";
+            clients.forEach(client => {
+                if (client.ws !== ws &&
+                    client.player.roomId === roomId &&
+                    client.ws.readyState === WebSocket.OPEN) {
+                    client.ws.send(out, { binary: true });
+                }
+            });
+            return;
+        }
+
+        // --- Текст: чат / позиции / комнаты (как было) ---
         try {
             const data = JSON.parse(message);
-            console.log(`[${player.name}] получил: ${data.type}`);
-
             switch (data.type) {
-                case "create_room":
-                    handleCreateRoom(ws, player, data);
-                    break;
-                case "request_join":
-                    handleRequestJoin(ws, player, data);
-                    break;
-                case "approve_join":
-                    handleApproveJoin(ws, player, data);
-                    break;
-                case "chat":
-                    handleChat(ws, player, data);
-                    break;
+                case "create_room":  handleCreateRoom(ws, player, data); break;
+                case "request_join": handleRequestJoin(ws, player, data); break;
+                case "approve_join": handleApproveJoin(ws, player, data); break;
+                case "chat":         handleChat(ws, player, data); break;
                 case "move":
                     player.x = data.x || 0;
                     player.y = data.y || 0;
@@ -67,12 +67,10 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         console.log(`[${player.name}] отключился`);
         clients = clients.filter(c => c.ws !== ws);
-
         rooms.forEach((room, roomId) => {
             room.members = room.members.filter(id => id !== player.id);
             if (room.creatorId === player.id) rooms.delete(roomId);
         });
-
         broadcastPlayersUpdate();
     });
 });
@@ -81,79 +79,40 @@ wss.on('connection', (ws) => {
 
 function handleCreateRoom(ws, player, data) {
     const roomId = "room_" + Date.now();
-
-    rooms.set(roomId, {
-        name: data.name || "Private Room",
-        creatorId: player.id,
-        members: [player.id]
-    });
-
+    rooms.set(roomId, { name: data.name || "Private Room", creatorId: player.id, members: [player.id] });
     player.roomId = roomId;
-
-    ws.send(JSON.stringify({
-        type: "room_created",
-        roomId: roomId,
-        name: rooms.get(roomId).name
-    }));
-
-    console.log(`[${player.name}] создал комнату ${roomId} (creator = ${player.id})`);
+    ws.send(JSON.stringify({ type: "room_created", roomId: roomId, name: rooms.get(roomId).name }));
+    console.log(`[${player.name}] создал комнату ${roomId}`);
 }
 
 function handleRequestJoin(ws, player, data) {
     const room = rooms.get(data.roomId);
-    if (!room) {
-        console.log(`Комната ${data.roomId} не найдена`);
-        return;
-    }
-
-    // Ищем клиента-создателя по ID
+    if (!room) return;
     const creatorClient = clients.find(c => c.player.id === room.creatorId);
-
     if (creatorClient && creatorClient.ws.readyState === WebSocket.OPEN) {
         creatorClient.ws.send(JSON.stringify({
-            type: "room_invite",
-            fromId: player.id,
-            fromName: player.name,
-            roomId: data.roomId
+            type: "room_invite", fromId: player.id, fromName: player.name, roomId: data.roomId
         }));
-        console.log(`[${player.name}] запросил вход → invite отправлен СОЗДАТЕЛЮ (id=${room.creatorId})`);
-    } else {
-        console.log(`Не удалось найти создателя комнаты ${data.roomId}`);
     }
 }
 
 function handleApproveJoin(ws, player, data) {
     const room = rooms.get(data.roomId);
     if (!room || room.creatorId !== player.id) return;
-
     const targetId = parseInt(data.userId);
-    const approved = !!data.approved;
-
-    if (approved) {
+    if (!!data.approved) {
         if (!room.members.includes(targetId)) room.members.push(targetId);
-
         const targetClient = clients.find(c => c.player.id === targetId);
         if (targetClient) {
             targetClient.player.roomId = data.roomId;
-            targetClient.ws.send(JSON.stringify({
-                type: "join_approved",
-                roomId: data.roomId
-            }));
+            targetClient.ws.send(JSON.stringify({ type: "join_approved", roomId: data.roomId }));
         }
-        console.log(`[${player.name}] одобрил вход игрока ${targetId}`);
     }
 }
 
 function handleChat(ws, player, data) {
     const roomId = player.roomId || "global";
-
-    const msg = {
-        type: "chat",
-        name: player.name,
-        text: data.text,
-        roomId: roomId
-    };
-
+    const msg = { type: "chat", name: player.name, text: data.text, roomId: roomId };
     clients.forEach(client => {
         if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
             client.ws.send(JSON.stringify(msg));
@@ -162,24 +121,13 @@ function handleChat(ws, player, data) {
 }
 
 function broadcastPlayersUpdate() {
-    const playersData = clients.map(c => ({
-        id: c.player.id,
-        name: c.player.name,
-        x: c.player.x || 0,
-        y: c.player.y || 0
-    }));
-
+    const playersData = clients.map(c => ({ id: c.player.id, name: c.player.name, x: c.player.x || 0, y: c.player.y || 0 }));
     const msg = JSON.stringify({ type: "update", players: playersData });
-
     clients.forEach(client => {
-        if (client.ws.readyState === WebSocket.OPEN) {
-            client.ws.send(msg);
-        }
+        if (client.ws.readyState === WebSocket.OPEN) client.ws.send(msg);
     });
 }
 
 setInterval(broadcastPlayersUpdate, 150);
 
-server.listen(PORT, () => {
-    console.log(`NEAR Server запущен на порту ${PORT}`);
-});
+server.listen(PORT, () => console.log(`NEAR Server запущен на порту ${PORT}`));
