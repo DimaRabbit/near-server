@@ -1,4 +1,3 @@
-
 const http = require('http');
 const WebSocket = require('ws');
 
@@ -29,14 +28,14 @@ wss.on('connection', (ws) => {
 
     ws.send(JSON.stringify({ type: "self_info", id: player.id, name: player.name }));
     broadcastPlayersUpdate();
-    sendExistingRooms(ws);   // рассказать новичку об уже открытых комнатах
+    sendExistingRooms(ws);
 
     ws.on('message', (message, isBinary) => {
         // --- ГОЛОС: бинарный кадр [int32 sampleRate][int16 PCM...] ---
         if (isBinary) {
             const header = Buffer.alloc(4);
-            header.writeInt32LE(player.id, 0);             // подставляем id отправителя
-            const out = Buffer.concat([header, message]);  // -> [id][sampleRate][PCM]
+            header.writeInt32LE(player.id, 0);
+            const out = Buffer.concat([header, message]);
             const roomId = player.roomId || "global";
             clients.forEach(client => {
                 if (client.ws !== ws &&
@@ -48,7 +47,6 @@ wss.on('connection', (ws) => {
             return;
         }
 
-        // --- Текст: чат / позиции / комнаты ---
         try {
             const data = JSON.parse(message);
             switch (data.type) {
@@ -59,6 +57,12 @@ wss.on('connection', (ws) => {
                 case "move":
                     player.x = data.x || 0;
                     player.y = data.y || 0;
+                    break;
+                case "set_name":
+                    if (typeof data.name === "string" && data.name.trim()) {
+                        player.name = data.name.trim().slice(0, 32);
+                        broadcastPlayersUpdate();
+                    }
                     break;
             }
         } catch (e) {
@@ -93,31 +97,23 @@ function handleCreateRoom(ws, player, data) {
     player.roomId = roomId;
     ws.send(JSON.stringify({ type: "room_created", roomId: roomId, name: rooms.get(roomId).name }));
     console.log(`[${player.name}] создал комнату ${roomId}`);
-    broadcastRoomAvailable(roomId);   // сообщаем всем об открытой комнате
+    broadcastRoomAvailable(roomId);
 }
 
 function handleRequestJoin(ws, player, data) {
     const room = rooms.get(data.roomId);
-    if (!room) {
-        console.log(`Комната ${data.roomId} не найдена`);
-        return;
-    }
+    if (!room) return;
     const creatorClient = clients.find(c => c.player.id === room.creatorId);
     if (creatorClient && creatorClient.ws.readyState === WebSocket.OPEN) {
         creatorClient.ws.send(JSON.stringify({
-            type: "room_invite",
-            fromId: player.id,
-            fromName: player.name,
-            roomId: data.roomId
+            type: "room_invite", fromId: player.id, fromName: player.name, roomId: data.roomId
         }));
-        console.log(`[${player.name}] запросил вход → invite создателю (id=${room.creatorId})`);
     }
 }
 
 function handleApproveJoin(ws, player, data) {
     const room = rooms.get(data.roomId);
     if (!room || room.creatorId !== player.id) return;
-
     const targetId = parseInt(data.userId);
     if (!!data.approved) {
         if (!room.members.includes(targetId)) room.members.push(targetId);
@@ -126,7 +122,6 @@ function handleApproveJoin(ws, player, data) {
             targetClient.player.roomId = data.roomId;
             targetClient.ws.send(JSON.stringify({ type: "join_approved", roomId: data.roomId }));
         }
-        console.log(`[${player.name}] одобрил вход игрока ${targetId}`);
     }
 }
 
@@ -145,11 +140,8 @@ function broadcastRoomAvailable(roomId) {
     if (!room) return;
     const creator = clients.find(c => c.player.id === room.creatorId);
     const msg = JSON.stringify({
-        type: "room_available",
-        roomId,
-        name: room.name,
-        creatorId: room.creatorId,
-        creatorName: creator ? creator.player.name : ""
+        type: "room_available", roomId, name: room.name,
+        creatorId: room.creatorId, creatorName: creator ? creator.player.name : ""
     });
     clients.forEach(c => { if (c.ws.readyState === WebSocket.OPEN) c.ws.send(msg); });
 }
@@ -158,11 +150,8 @@ function sendExistingRooms(ws) {
     rooms.forEach((room, roomId) => {
         const creator = clients.find(c => c.player.id === room.creatorId);
         ws.send(JSON.stringify({
-            type: "room_available",
-            roomId,
-            name: room.name,
-            creatorId: room.creatorId,
-            creatorName: creator ? creator.player.name : ""
+            type: "room_available", roomId, name: room.name,
+            creatorId: room.creatorId, creatorName: creator ? creator.player.name : ""
         }));
     });
 }
