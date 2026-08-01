@@ -13,6 +13,12 @@ const wss = new WebSocket.Server({ server });
 let clients = [];
 let rooms = new Map();
 let nextPlayerId = 1;
+let nextBulletinId = 1;
+let nextReplyId = 1;
+/** @type {{ id:string, kind:string, title:string, body:string, linkUrl:string, authorName:string, authorId:number, createdUnix:number }[]} */
+let bulletinPosts = [];
+/** @type {{ id:string, postId:string, fromName:string, fromId:number, text:string, createdUnix:number }[]} */
+let bulletinReplies = [];
 
 wss.on('connection', (ws) => {
     const player = {
@@ -63,6 +69,15 @@ wss.on('connection', (ws) => {
                         player.name = data.name.trim().slice(0, 32);
                         broadcastPlayersUpdate();
                     }
+                    break;
+                case "bulletin_list":
+                    sendBulletinSnapshot(ws);
+                    break;
+                case "bulletin_post":
+                    handleBulletinPost(ws, player, data);
+                    break;
+                case "bulletin_reply":
+                    handleBulletinReply(ws, player, data);
                     break;
             }
         } catch (e) {
@@ -154,6 +169,103 @@ function sendExistingRooms(ws) {
             creatorId: room.creatorId, creatorName: creator ? creator.player.name : ""
         }));
     });
+}
+
+function sendBulletinSnapshot(ws) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+        type: "bulletin_snapshot",
+        posts: bulletinPosts,
+        replies: bulletinReplies
+    }));
+}
+
+function broadcastBulletinSnapshot() {
+    const msg = JSON.stringify({
+        type: "bulletin_snapshot",
+        posts: bulletinPosts,
+        replies: bulletinReplies
+    });
+    clients.forEach(c => {
+        if (c.ws.readyState === WebSocket.OPEN) c.ws.send(msg);
+    });
+}
+
+function handleBulletinPost(ws, player, data) {
+    const kind = (data.kind === "resume") ? "resume" : "vacancy";
+    const title = (typeof data.title === "string" ? data.title : "").trim().slice(0, 80);
+    const body = (typeof data.body === "string" ? data.body : "").trim().slice(0, 2000);
+    const linkUrl = (typeof data.linkUrl === "string" ? data.linkUrl : "").trim().slice(0, 500);
+    if (!title) {
+        ws.send(JSON.stringify({ type: "bulletin_error", message: "Нужен заголовок" }));
+        return;
+    }
+    const post = {
+        id: "bp_" + (nextBulletinId++),
+        kind,
+        title,
+        body,
+        linkUrl,
+        authorName: player.name,
+        authorId: player.id,
+        createdUnix: Math.floor(Date.now() / 1000)
+    };
+    bulletinPosts.unshift(post);
+    if (bulletinPosts.length > 200) bulletinPosts.length = 200;
+    console.log(`[bulletin] ${player.name} post ${post.kind}: ${post.title}`);
+    broadcastBulletinSnapshot();
+}
+
+function handleBulletinReply(ws, player, data) {
+    const postId = typeof data.postId === "string" ? data.postId : "";
+    const text = (typeof data.text === "string" ? data.text : "").trim().slice(0, 500);
+    if (!postId || !text) {
+        ws.send(JSON.stringify({ type: "bulletin_error", message: "Пустой отклик" }));
+        return;
+    }
+    const post = bulletinPosts.find(p => p.id === postId);
+    if (!post) {
+        ws.send(JSON.stringify({ type: "bulletin_error", message: "Объявление не найдено" }));
+        return;
+    }
+    const reply = {
+        id: "br_" + (nextReplyId++),
+        postId,
+        fromName: player.name,
+        fromId: player.id,
+        text,
+        createdUnix: Math.floor(Date.now() / 1000)
+    };
+    bulletinReplies.push(reply);
+    if (bulletinReplies.length > 500) bulletinReplies.splice(0, bulletinReplies.length - 500);
+
+    broadcastBulletinSnapshot();
+
+    const authorClient = clients.find(c => c.player.id === post.authorId);
+    if (authorClient && authorClient.ws.readyState === WebSocket.OPEN) {
+        authorClient.ws.send(JSON.stringify({
+            type: "bulletin_reply_notify",
+            postId,
+            postTitle: post.title,
+            fromName: player.name,
+            fromId: player.id,
+            text
+        }));
+        // Дублируем в чат автора (его текущая room), чтобы было видно в ленте.
+        const roomId = authorClient.player.roomId || "global";
+        const chatText = `[отклик] ${player.name} → «${post.title}»: ${text}`;
+        clients.forEach(client => {
+            if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
+                client.ws.send(JSON.stringify({
+                    type: "chat",
+                    name: "Доска",
+                    text: chatText,
+                    roomId
+                }));
+            }
+        });
+    }
+    console.log(`[bulletin] reply from ${player.name} on ${postId}`);
 }
 
 function broadcastPlayersUpdate() {
