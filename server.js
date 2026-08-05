@@ -26,7 +26,9 @@ wss.on('connection', (ws) => {
         name: `User_${(nextPlayerId - 1).toString().slice(-4)}`,
         roomId: "global",
         x: 0,
-        y: 0
+        y: 0,
+        whoCanMessage: "everyone", // everyone | friends | nobody
+        friendNames: []
     };
 
     clients.push({ ws, player });
@@ -69,6 +71,15 @@ wss.on('connection', (ws) => {
                         player.name = data.name.trim().slice(0, 32);
                         broadcastPlayersUpdate();
                     }
+                    break;
+                case "set_privacy":
+                    handleSetPrivacy(player, data);
+                    break;
+                case "set_friends":
+                    handleSetFriends(player, data);
+                    break;
+                case "dm_send":
+                    handleDmSend(ws, player, data);
                     break;
                 case "bulletin_list":
                     sendBulletinSnapshot(ws);
@@ -266,6 +277,82 @@ function handleBulletinReply(ws, player, data) {
         });
     }
     console.log(`[bulletin] reply from ${player.name} on ${postId}`);
+}
+
+function handleSetPrivacy(player, data) {
+    const raw = (typeof data.whoCanMessage === "string" ? data.whoCanMessage : "everyone").toLowerCase();
+    if (raw === "friends" || raw === "nobody" || raw === "everyone") {
+        player.whoCanMessage = raw;
+    }
+}
+
+function handleSetFriends(player, data) {
+    const names = Array.isArray(data.names) ? data.names : [];
+    player.friendNames = names
+        .filter(n => typeof n === "string" && n.trim())
+        .map(n => n.trim().slice(0, 32))
+        .slice(0, 200);
+}
+
+function findClientByIdOrName(toId, toName) {
+    if (toId != null && toId !== "") {
+        const idNum = parseInt(toId, 10);
+        if (!Number.isNaN(idNum)) {
+            const byId = clients.find(c => c.player.id === idNum);
+            if (byId) return byId;
+        }
+    }
+    if (typeof toName === "string" && toName.trim()) {
+        const want = toName.trim().toLowerCase();
+        return clients.find(c => (c.player.name || "").toLowerCase() === want) || null;
+    }
+    return null;
+}
+
+function isFriendOf(targetPlayer, senderName) {
+    const want = (senderName || "").toLowerCase();
+    return (targetPlayer.friendNames || []).some(n => (n || "").toLowerCase() === want);
+}
+
+function handleDmSend(ws, player, data) {
+    const text = (typeof data.text === "string" ? data.text : "").trim().slice(0, 1000);
+    if (!text) {
+        ws.send(JSON.stringify({ type: "dm_error", message: "Пустое сообщение" }));
+        return;
+    }
+    const target = findClientByIdOrName(data.toId, data.toName);
+    if (!target) {
+        ws.send(JSON.stringify({ type: "dm_error", message: "Игрок не в сети" }));
+        return;
+    }
+    if (target.player.id === player.id) {
+        ws.send(JSON.stringify({ type: "dm_error", message: "Нельзя писать себе" }));
+        return;
+    }
+
+    const policy = target.player.whoCanMessage || "everyone";
+    if (policy === "nobody") {
+        ws.send(JSON.stringify({ type: "dm_error", message: "Личка закрыта" }));
+        return;
+    }
+    if (policy === "friends" && !isFriendOf(target.player, player.name)) {
+        ws.send(JSON.stringify({ type: "dm_error", message: "Писать могут только друзья" }));
+        return;
+    }
+
+    const payload = {
+        type: "dm_receive",
+        fromId: player.id,
+        fromName: player.name,
+        toId: target.player.id,
+        toName: target.player.name,
+        text,
+        createdUnix: Math.floor(Date.now() / 1000)
+    };
+    const msg = JSON.stringify(payload);
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    if (target.ws.readyState === WebSocket.OPEN) target.ws.send(msg);
+    console.log(`[dm] ${player.name} → ${target.player.name}: ${text.slice(0, 40)}`);
 }
 
 function broadcastPlayersUpdate() {
