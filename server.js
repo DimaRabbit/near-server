@@ -170,8 +170,11 @@ function officeKeyFromRoomName(name) {
 
 function getOfficeBoard(officeKey) {
     if (!officeBoards.has(officeKey))
-        officeBoards.set(officeKey, { cards: [], reports: [], whiteboards: [] });
-    return officeBoards.get(officeKey);
+        officeBoards.set(officeKey, { cards: [], reports: [], whiteboards: [], whiteboardStrokes: [] });
+    const board = officeBoards.get(officeKey);
+    if (!board.whiteboards) board.whiteboards = [];
+    if (!board.whiteboardStrokes) board.whiteboardStrokes = [];
+    return board;
 }
 
 function resolveOfficeKeyForPlayer(player) {
@@ -273,7 +276,10 @@ function sendOfficeSnapshot(ws, officeKey, roomId) {
         roomId: roomId || '',
         cards: board.cards,
         reports: board.reports,
-        whiteboards: board.whiteboards || []
+        whiteboards: {
+            notes: board.whiteboards || [],
+            strokes: board.whiteboardStrokes || []
+        }
     }));
 }
 
@@ -361,6 +367,7 @@ function applyOfficeSignal(player, text) {
 
     if (parts[0] === 'wb') {
         if (!board.whiteboards) board.whiteboards = [];
+        if (!board.whiteboardStrokes) board.whiteboardStrokes = [];
         const op = (parts[1] || '').toLowerCase();
         if (op === 'add' && parts.length >= 6) {
             const note = {
@@ -378,6 +385,28 @@ function applyOfficeSignal(player, text) {
         if (op === 'del' && parts.length >= 3) {
             const id = parts[2];
             board.whiteboards = board.whiteboards.filter(n => n.id !== id);
+            return true;
+        }
+        if (op === 'stroke' && parts.length >= 6) {
+            const packed = String(parts[5] || '').replace(/[^0-9]/g, '').slice(0, 112);
+            if (packed.length < 8) return true;
+            const stroke = {
+                id: parts[2],
+                author: parts[3] || '',
+                color: Math.max(0, Math.min(5, parseInt(parts[4], 10) || 0)),
+                points: packed
+            };
+            const idx = board.whiteboardStrokes.findIndex(s => s.id === stroke.id);
+            if (idx >= 0) board.whiteboardStrokes[idx] = stroke;
+            else board.whiteboardStrokes.push(stroke);
+            if (board.whiteboardStrokes.length > 80)
+                board.whiteboardStrokes = board.whiteboardStrokes.slice(-80);
+            return true;
+        }
+        if (op === 'strokeclear' && parts.length >= 3) {
+            const author = (parts[2] || '').toLowerCase();
+            board.whiteboardStrokes = board.whiteboardStrokes.filter(
+                s => (s.author || '').toLowerCase() !== author);
             return true;
         }
         if (op === 'hello') {

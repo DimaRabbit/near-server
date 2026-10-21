@@ -36,7 +36,8 @@ https://near-server.onrender.com/
 5. В логах: `bulletin+office→Supabase` (не `RAM only`).
 
 Presence: `move` несёт `speed/yaw/falling`; `set_skin` + поле `skin` в `update`.  
-Office: при create/join/hello сервер шлёт `office_snapshot` (cards + reports).
+Office: при create/join/hello сервер шлёт `office_snapshot` (cards + reports + whiteboards.notes/strokes).
+Whiteboard freehand: `wb|stroke|id|author|color|packedUV`, clear own: `wb|strokeclear|author`.
 
 ## Игра
 
