@@ -170,7 +170,7 @@ function officeKeyFromRoomName(name) {
 
 function getOfficeBoard(officeKey) {
     if (!officeBoards.has(officeKey))
-        officeBoards.set(officeKey, { cards: [], reports: [] });
+        officeBoards.set(officeKey, { cards: [], reports: [], whiteboards: [] });
     return officeBoards.get(officeKey);
 }
 
@@ -272,7 +272,8 @@ function sendOfficeSnapshot(ws, officeKey, roomId) {
         officeKey,
         roomId: roomId || '',
         cards: board.cards,
-        reports: board.reports
+        reports: board.reports,
+        whiteboards: board.whiteboards || []
     }));
 }
 
@@ -350,6 +351,33 @@ function applyOfficeSignal(player, text) {
             if (board.reports.length > 500) board.reports = board.reports.slice(-500);
             persistOfficeReport(officeKey, rep).catch(e =>
                 console.error('[office] persist report:', e.message || e));
+            return true;
+        }
+        if (op === 'hello') {
+            sendOfficeSnapshot(player._ws || null, officeKey, player.roomId);
+            return true;
+        }
+    }
+
+    if (parts[0] === 'wb') {
+        if (!board.whiteboards) board.whiteboards = [];
+        const op = (parts[1] || '').toLowerCase();
+        if (op === 'add' && parts.length >= 6) {
+            const note = {
+                id: parts[2],
+                author: parts[3] || '',
+                color: parseInt(parts[4], 10) || 0,
+                text: parts.slice(5).join('|').slice(0, 180)
+            };
+            const idx = board.whiteboards.findIndex(n => n.id === note.id);
+            if (idx >= 0) board.whiteboards[idx] = note;
+            else board.whiteboards.push(note);
+            if (board.whiteboards.length > 100) board.whiteboards = board.whiteboards.slice(-100);
+            return true;
+        }
+        if (op === 'del' && parts.length >= 3) {
+            const id = parts[2];
+            board.whiteboards = board.whiteboards.filter(n => n.id !== id);
             return true;
         }
         if (op === 'hello') {
