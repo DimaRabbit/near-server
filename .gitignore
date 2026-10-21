@@ -1,0 +1,7 @@
+node_modules/
+package-lock.json
+cloudflared-*.log
+CURRENT_TUNNEL_HOST.txt
+.env
+.env.*
+*.log

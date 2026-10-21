@@ -2,6 +2,9 @@ const http = require('http');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 10000;
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SUPABASE_READY = !!(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -20,6 +23,345 @@ let bulletinPosts = [];
 /** @type {{ id:string, postId:string, fromName:string, fromId:number, text:string, createdUnix:number }[]} */
 let bulletinReplies = [];
 
+// ====================== SUPABASE ======================
+
+function sbHeaders(extra) {
+    return Object.assign({
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json'
+    }, extra || {});
+}
+
+async function sbFetch(path, options) {
+    if (!SUPABASE_READY) return null;
+    const res = await fetch(SUPABASE_URL + '/rest/v1/' + path, options);
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`Supabase ${res.status}: ${body.slice(0, 200)}`);
+    }
+    if (res.status === 204) return null;
+    const text = await res.text();
+    if (!text) return null;
+    return JSON.parse(text);
+}
+
+function rowToPost(row) {
+    return {
+        id: row.id,
+        kind: row.kind,
+        title: row.title || '',
+        body: row.body || '',
+        linkUrl: row.link_url || '',
+        authorName: row.author_name || '',
+        authorId: row.author_session_id || 0,
+        createdUnix: Number(row.created_unix) || 0
+    };
+}
+
+function rowToReply(row) {
+    return {
+        id: row.id,
+        postId: row.post_id,
+        fromName: row.from_name || '',
+        fromId: row.from_session_id || 0,
+        text: row.text || '',
+        createdUnix: Number(row.created_unix) || 0
+    };
+}
+
+function bumpIdsFromLoaded() {
+    let maxBp = 0;
+    let maxBr = 0;
+    for (const p of bulletinPosts) {
+        const m = /^bp_(\d+)$/.exec(p.id);
+        if (m) maxBp = Math.max(maxBp, parseInt(m[1], 10));
+    }
+    for (const r of bulletinReplies) {
+        const m = /^br_(\d+)$/.exec(r.id);
+        if (m) maxBr = Math.max(maxBr, parseInt(m[1], 10));
+    }
+    nextBulletinId = Math.max(nextBulletinId, maxBp + 1);
+    nextReplyId = Math.max(nextReplyId, maxBr + 1);
+}
+
+async function hydrateBulletinFromSupabase() {
+    if (!SUPABASE_READY) {
+        console.log('[bulletin] Supabase env не задан — только RAM');
+        return;
+    }
+    try {
+        const posts = await sbFetch(
+            'bulletin_posts?select=*&order=created_unix.desc&limit=200',
+            { method: 'GET', headers: sbHeaders() }
+        );
+        const replies = await sbFetch(
+            'bulletin_replies?select=*&order=created_unix.asc&limit=500',
+            { method: 'GET', headers: sbHeaders() }
+        );
+        bulletinPosts = Array.isArray(posts) ? posts.map(rowToPost) : [];
+        bulletinReplies = Array.isArray(replies) ? replies.map(rowToReply) : [];
+        bumpIdsFromLoaded();
+        console.log(`[bulletin] hydrate: ${bulletinPosts.length} posts, ${bulletinReplies.length} replies`);
+    } catch (e) {
+        console.error('[bulletin] hydrate failed:', e.message || e);
+    }
+}
+
+async function persistBulletinPost(post) {
+    if (!SUPABASE_READY) return;
+    await sbFetch('bulletin_posts', {
+        method: 'POST',
+        headers: sbHeaders({ Prefer: 'return=minimal' }),
+        body: JSON.stringify({
+            id: post.id,
+            kind: post.kind,
+            title: post.title,
+            body: post.body,
+            link_url: post.linkUrl,
+            author_name: post.authorName,
+            author_session_id: post.authorId,
+            author_user_id: null,
+            created_unix: post.createdUnix
+        })
+    });
+}
+
+async function persistBulletinReply(reply) {
+    if (!SUPABASE_READY) return;
+    await sbFetch('bulletin_replies', {
+        method: 'POST',
+        headers: sbHeaders({ Prefer: 'return=minimal' }),
+        body: JSON.stringify({
+            id: reply.id,
+            post_id: reply.postId,
+            from_name: reply.fromName,
+            from_session_id: reply.fromId,
+            from_user_id: null,
+            text: reply.text,
+            created_unix: reply.createdUnix
+        })
+    });
+}
+
+function normalizeLinkUrl(raw) {
+    let url = (typeof raw === 'string' ? raw : '').trim().slice(0, 500);
+    if (!url) return '';
+    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url))
+        url = 'https://' + url;
+    return url;
+}
+
+function parseBulletinKind(raw) {
+    const k = (typeof raw === 'string' ? raw : '').toLowerCase().trim();
+    if (k === 'resume') return 'resume';
+    if (k === 'portfolio') return 'portfolio';
+    return 'vacancy';
+}
+
+// ====================== OFFICE BOARD ======================
+/** @type {Map<string, { cards: object[], reports: object[] }>} */
+const officeBoards = new Map();
+
+function officeKeyFromRoomName(name) {
+    const display = String(name || '').split('~')[0].trim().toLowerCase().slice(0, 64);
+    return display || 'default';
+}
+
+function getOfficeBoard(officeKey) {
+    if (!officeBoards.has(officeKey))
+        officeBoards.set(officeKey, { cards: [], reports: [] });
+    return officeBoards.get(officeKey);
+}
+
+function resolveOfficeKeyForPlayer(player) {
+    const room = rooms.get(player.roomId);
+    if (room && room.officeKey) return room.officeKey;
+    return null;
+}
+
+async function hydrateOfficeBoardsFromSupabase() {
+    if (!SUPABASE_READY) {
+        console.log('[office] Supabase env не задан — Kanban только RAM');
+        return;
+    }
+    try {
+        const cards = await sbFetch(
+            'office_board_cards?select=*&order=updated_unix.asc&limit=2000',
+            { method: 'GET', headers: sbHeaders() }
+        );
+        const reports = await sbFetch(
+            'office_day_reports?select=*&order=updated_unix.asc&limit=2000',
+            { method: 'GET', headers: sbHeaders() }
+        );
+        officeBoards.clear();
+        if (Array.isArray(cards)) {
+            for (const row of cards) {
+                const key = row.office_key || 'default';
+                const board = getOfficeBoard(key);
+                board.cards.push({
+                    id: row.id,
+                    column: row.column_id || 'todo',
+                    author: row.author || '',
+                    dueDate: row.due_date || '',
+                    text: row.body || ''
+                });
+            }
+        }
+        if (Array.isArray(reports)) {
+            for (const row of reports) {
+                const key = row.office_key || 'default';
+                const board = getOfficeBoard(key);
+                board.reports.push({
+                    author: row.author || '',
+                    dateYmd: row.date_ymd || '',
+                    text: row.body || ''
+                });
+            }
+        }
+        console.log(`[office] hydrate: ${officeBoards.size} offices`);
+    } catch (e) {
+        console.error('[office] hydrate failed:', e.message || e);
+    }
+}
+
+async function persistOfficeCard(officeKey, card) {
+    if (!SUPABASE_READY) return;
+    await sbFetch('office_board_cards', {
+        method: 'POST',
+        headers: sbHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify({
+            office_key: officeKey,
+            id: card.id,
+            column_id: card.column,
+            author: card.author,
+            due_date: card.dueDate || '',
+            body: card.text || '',
+            updated_unix: Math.floor(Date.now() / 1000)
+        })
+    });
+}
+
+async function deleteOfficeCard(officeKey, cardId) {
+    if (!SUPABASE_READY) return;
+    const path = 'office_board_cards?office_key=eq.' + encodeURIComponent(officeKey)
+        + '&id=eq.' + encodeURIComponent(cardId);
+    await sbFetch(path, { method: 'DELETE', headers: sbHeaders() });
+}
+
+async function persistOfficeReport(officeKey, rep) {
+    if (!SUPABASE_READY) return;
+    await sbFetch('office_day_reports', {
+        method: 'POST',
+        headers: sbHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify({
+            office_key: officeKey,
+            author: rep.author,
+            date_ymd: rep.dateYmd,
+            body: rep.text || '',
+            updated_unix: Math.floor(Date.now() / 1000)
+        })
+    });
+}
+
+function sendOfficeSnapshot(ws, officeKey, roomId) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !officeKey) return;
+    const board = getOfficeBoard(officeKey);
+    ws.send(JSON.stringify({
+        type: 'office_snapshot',
+        officeKey,
+        roomId: roomId || '',
+        cards: board.cards,
+        reports: board.reports
+    }));
+}
+
+function applyOfficeSignal(player, text) {
+    if (typeof text !== 'string' || !text.startsWith('__near|')) return false;
+    const officeKey = resolveOfficeKeyForPlayer(player);
+    if (!officeKey) return false;
+
+    const payload = text.slice('__near|'.length);
+    const parts = payload.split('|');
+    if (parts.length < 2) return false;
+    const board = getOfficeBoard(officeKey);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (parts[0] === 'board') {
+        const op = (parts[1] || '').toLowerCase();
+        if ((op === 'add' || op === 'edit') && parts.length >= 7) {
+            const id = parts[2];
+            const column = ['todo', 'doing', 'done'].includes((parts[3] || '').toLowerCase())
+                ? parts[3].toLowerCase() : 'todo';
+            const author = parts[4] || '';
+            let dueDate = '';
+            let textIdx = 5;
+            const maybeDue = parts[5] || '';
+            if (maybeDue === '-' || /^\d{4}-\d{2}-\d{2}$/.test(maybeDue)) {
+                dueDate = maybeDue === '-' ? '' : maybeDue;
+                textIdx = 6;
+            }
+            const cardText = parts.slice(textIdx).join('|').slice(0, 180);
+            const card = { id, column, author, dueDate, text: cardText };
+            const idx = board.cards.findIndex(c => c.id === id);
+            if (idx >= 0) board.cards[idx] = card;
+            else board.cards.push(card);
+            if (board.cards.length > 200) board.cards = board.cards.slice(-200);
+            persistOfficeCard(officeKey, card).catch(e =>
+                console.error('[office] persist card:', e.message || e));
+            return true;
+        }
+        if (op === 'move' && parts.length >= 4) {
+            const id = parts[2];
+            const column = ['todo', 'doing', 'done'].includes((parts[3] || '').toLowerCase())
+                ? parts[3].toLowerCase() : 'todo';
+            const card = board.cards.find(c => c.id === id);
+            if (card) {
+                card.column = column;
+                persistOfficeCard(officeKey, card).catch(e =>
+                    console.error('[office] persist move:', e.message || e));
+            }
+            return true;
+        }
+        if (op === 'del' && parts.length >= 3) {
+            const id = parts[2];
+            board.cards = board.cards.filter(c => c.id !== id);
+            deleteOfficeCard(officeKey, id).catch(e =>
+                console.error('[office] delete card:', e.message || e));
+            return true;
+        }
+        if (op === 'hello') {
+            sendOfficeSnapshot(player._ws || null, officeKey, player.roomId);
+            return true;
+        }
+    }
+
+    if (parts[0] === 'report') {
+        const op = (parts[1] || '').toLowerCase();
+        if (op === 'set' && parts.length >= 5) {
+            const dateYmd = parts[2] || '';
+            const author = parts[3] || '';
+            const repText = parts.slice(4).join('|').slice(0, 180);
+            const rep = { author, dateYmd, text: repText };
+            const idx = board.reports.findIndex(r =>
+                r.dateYmd === dateYmd && (r.author || '').toLowerCase() === author.toLowerCase());
+            if (idx >= 0) board.reports[idx] = rep;
+            else board.reports.push(rep);
+            if (board.reports.length > 500) board.reports = board.reports.slice(-500);
+            persistOfficeReport(officeKey, rep).catch(e =>
+                console.error('[office] persist report:', e.message || e));
+            return true;
+        }
+        if (op === 'hello') {
+            sendOfficeSnapshot(player._ws || null, officeKey, player.roomId);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ====================== WS ======================
+
 wss.on('connection', (ws) => {
     const player = {
         id: nextPlayerId++,
@@ -27,10 +369,15 @@ wss.on('connection', (ws) => {
         roomId: "global",
         x: 0,
         y: 0,
+        speed: 0,
+        yaw: 0,
+        falling: false,
+        skin: "manny",
         whoCanMessage: "everyone", // everyone | friends | nobody
         friendNames: []
     };
 
+    player._ws = ws;
     clients.push({ ws, player });
     console.log(`[${player.name}] (id=${player.id}) подключился`);
 
@@ -63,12 +410,24 @@ wss.on('connection', (ws) => {
                 case "approve_join": handleApproveJoin(ws, player, data); break;
                 case "chat":         handleChat(ws, player, data); break;
                 case "move":
-                    player.x = data.x || 0;
-                    player.y = data.y || 0;
+                    player.x = typeof data.x === "number" ? data.x : (data.x || 0);
+                    player.y = typeof data.y === "number" ? data.y : (data.y || 0);
+                    if (typeof data.speed === "number" && Number.isFinite(data.speed))
+                        player.speed = Math.max(0, Math.min(1200, data.speed));
+                    if (typeof data.yaw === "number" && Number.isFinite(data.yaw))
+                        player.yaw = data.yaw;
+                    if (typeof data.falling === "boolean")
+                        player.falling = data.falling;
                     break;
                 case "set_name":
                     if (typeof data.name === "string" && data.name.trim()) {
                         player.name = data.name.trim().slice(0, 32);
+                        broadcastPlayersUpdate();
+                    }
+                    break;
+                case "set_skin":
+                    if (typeof data.skin === "string" && data.skin.trim()) {
+                        player.skin = data.skin.trim().slice(0, 48).toLowerCase();
                         broadcastPlayersUpdate();
                     }
                     break;
@@ -119,10 +478,19 @@ wss.on('connection', (ws) => {
 
 function handleCreateRoom(ws, player, data) {
     const roomId = "room_" + Date.now();
-    rooms.set(roomId, { name: data.name || "Private Room", creatorId: player.id, members: [player.id] });
+    const roomName = data.name || "Private Room";
+    const officeKey = officeKeyFromRoomName(roomName);
+    rooms.set(roomId, {
+        name: roomName,
+        creatorId: player.id,
+        members: [player.id],
+        officeKey
+    });
     player.roomId = roomId;
-    ws.send(JSON.stringify({ type: "room_created", roomId: roomId, name: rooms.get(roomId).name }));
-    console.log(`[${player.name}] создал комнату ${roomId}`);
+    getOfficeBoard(officeKey); // ensure RAM entry
+    ws.send(JSON.stringify({ type: "room_created", roomId: roomId, name: roomName }));
+    sendOfficeSnapshot(ws, officeKey, roomId);
+    console.log(`[${player.name}] создал комнату ${roomId} (office=${officeKey})`);
     broadcastRoomAvailable(roomId);
 }
 
@@ -147,13 +515,20 @@ function handleApproveJoin(ws, player, data) {
         if (targetClient) {
             targetClient.player.roomId = data.roomId;
             targetClient.ws.send(JSON.stringify({ type: "join_approved", roomId: data.roomId }));
+            if (room.officeKey)
+                sendOfficeSnapshot(targetClient.ws, room.officeKey, data.roomId);
         }
     }
 }
 
 function handleChat(ws, player, data) {
     const roomId = player.roomId || "global";
-    const msg = { type: "chat", name: player.name, text: data.text, roomId: roomId };
+    const text = typeof data.text === 'string' ? data.text : '';
+    // Kanban / day report: обновить server+Supabase до fan-out (hello → snapshot).
+    if (text.startsWith('__near|'))
+        applyOfficeSignal(player, text);
+
+    const msg = { type: "chat", name: player.name, text: text, roomId: roomId };
     clients.forEach(client => {
         if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
             client.ws.send(JSON.stringify(msg));
@@ -203,12 +578,16 @@ function broadcastBulletinSnapshot() {
 }
 
 function handleBulletinPost(ws, player, data) {
-    const kind = (data.kind === "resume") ? "resume" : "vacancy";
+    const kind = parseBulletinKind(data.kind);
     const title = (typeof data.title === "string" ? data.title : "").trim().slice(0, 80);
     const body = (typeof data.body === "string" ? data.body : "").trim().slice(0, 2000);
-    const linkUrl = (typeof data.linkUrl === "string" ? data.linkUrl : "").trim().slice(0, 500);
+    const linkUrl = normalizeLinkUrl(data.linkUrl);
     if (!title) {
         ws.send(JSON.stringify({ type: "bulletin_error", message: "Нужен заголовок" }));
+        return;
+    }
+    if (kind === "portfolio" && !linkUrl) {
+        ws.send(JSON.stringify({ type: "bulletin_error", message: "Для портфолио нужна ссылка" }));
         return;
     }
     const post = {
@@ -225,6 +604,10 @@ function handleBulletinPost(ws, player, data) {
     if (bulletinPosts.length > 200) bulletinPosts.length = 200;
     console.log(`[bulletin] ${player.name} post ${post.kind}: ${post.title}`);
     broadcastBulletinSnapshot();
+
+    persistBulletinPost(post).catch(e => {
+        console.error('[bulletin] persist post failed:', e.message || e);
+    });
 }
 
 function handleBulletinReply(ws, player, data) {
@@ -251,6 +634,10 @@ function handleBulletinReply(ws, player, data) {
     if (bulletinReplies.length > 500) bulletinReplies.splice(0, bulletinReplies.length - 500);
 
     broadcastBulletinSnapshot();
+
+    persistBulletinReply(reply).catch(e => {
+        console.error('[bulletin] persist reply failed:', e.message || e);
+    });
 
     const authorClient = clients.find(c => c.player.id === post.authorId);
     if (authorClient && authorClient.ws.readyState === WebSocket.OPEN) {
@@ -356,7 +743,16 @@ function handleDmSend(ws, player, data) {
 }
 
 function broadcastPlayersUpdate() {
-    const playersData = clients.map(c => ({ id: c.player.id, name: c.player.name, x: c.player.x || 0, y: c.player.y || 0 }));
+    const playersData = clients.map(c => ({
+        id: c.player.id,
+        name: c.player.name,
+        x: c.player.x || 0,
+        y: c.player.y || 0,
+        speed: typeof c.player.speed === "number" ? c.player.speed : 0,
+        yaw: typeof c.player.yaw === "number" ? c.player.yaw : 0,
+        falling: !!c.player.falling,
+        skin: typeof c.player.skin === "string" && c.player.skin ? c.player.skin : "manny"
+    }));
     const msg = JSON.stringify({ type: "update", players: playersData });
     clients.forEach(client => {
         if (client.ws.readyState === WebSocket.OPEN) client.ws.send(msg);
@@ -365,4 +761,12 @@ function broadcastPlayersUpdate() {
 
 setInterval(broadcastPlayersUpdate, 150);
 
-server.listen(PORT, () => console.log(`NEAR Server запущен на порту ${PORT}`));
+Promise.all([
+    hydrateBulletinFromSupabase(),
+    hydrateOfficeBoardsFromSupabase()
+]).finally(() => {
+    server.listen(PORT, () => {
+        console.log(`NEAR Server запущен на порту ${PORT}` +
+            (SUPABASE_READY ? ' (bulletin+office→Supabase)' : ' (RAM only)'));
+    });
+});
