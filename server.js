@@ -1,12 +1,54 @@
 const http = require('http');
 const WebSocket = require('ws');
+const {
+    createEmptyBoard,
+    ensureBoardArrays,
+    applyWbSignal,
+    buildOfficeSnapshot,
+    playersUpdateFingerprint
+} = require('./lib/officeBoard');
 
 const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_READY = !!(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 
+const serverStartedUnix = Math.floor(Date.now() / 1000);
+let lastPlayersFingerprint = '';
+let updateBroadcastsSkipped = 0;
+let updateBroadcastsSent = 0;
+
 const server = http.createServer((req, res) => {
+    const url = (req.url || '/').split('?')[0];
+    if (url === '/health' || url === '/ready') {
+        let officeCount = 0;
+        let noteCount = 0;
+        let strokeCount = 0;
+        for (const board of officeBoards.values()) {
+            officeCount++;
+            noteCount += (board.whiteboards || []).length;
+            strokeCount += (board.whiteboardStrokes || []).length;
+        }
+        const body = JSON.stringify({
+            ok: true,
+            service: 'near-server',
+            port: Number(PORT),
+            uptimeSec: Math.floor(Date.now() / 1000) - serverStartedUnix,
+            supabase: SUPABASE_READY,
+            clients: clients.length,
+            rooms: rooms.size,
+            offices: officeCount,
+            whiteboardNotes: noteCount,
+            whiteboardStrokes: strokeCount,
+            bulletinPosts: bulletinPosts.length,
+            updateBroadcastsSent,
+            updateBroadcastsSkipped,
+            tickMs: 150
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(body);
+        return;
+    }
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('NEAR Server Running');
 });
@@ -170,11 +212,8 @@ function officeKeyFromRoomName(name) {
 
 function getOfficeBoard(officeKey) {
     if (!officeBoards.has(officeKey))
-        officeBoards.set(officeKey, { cards: [], reports: [], whiteboards: [], whiteboardStrokes: [] });
-    const board = officeBoards.get(officeKey);
-    if (!board.whiteboards) board.whiteboards = [];
-    if (!board.whiteboardStrokes) board.whiteboardStrokes = [];
-    return board;
+        officeBoards.set(officeKey, createEmptyBoard());
+    return ensureBoardArrays(officeBoards.get(officeKey));
 }
 
 function resolveOfficeKeyForPlayer(player) {
@@ -185,7 +224,7 @@ function resolveOfficeKeyForPlayer(player) {
 
 async function hydrateOfficeBoardsFromSupabase() {
     if (!SUPABASE_READY) {
-        console.log('[office] Supabase env не задан — Kanban только RAM');
+        console.log('[office] Supabase env missing — Kanban/whiteboard RAM only');
         return;
     }
     try {
@@ -195,6 +234,14 @@ async function hydrateOfficeBoardsFromSupabase() {
         );
         const reports = await sbFetch(
             'office_day_reports?select=*&order=updated_unix.asc&limit=2000',
+            { method: 'GET', headers: sbHeaders() }
+        );
+        const wbNotes = await sbFetch(
+            'office_wb_notes?select=*&order=updated_unix.asc&limit=2000',
+            { method: 'GET', headers: sbHeaders() }
+        );
+        const wbStrokes = await sbFetch(
+            'office_wb_strokes?select=*&order=updated_unix.asc&limit=2000',
             { method: 'GET', headers: sbHeaders() }
         );
         officeBoards.clear();
@@ -222,7 +269,37 @@ async function hydrateOfficeBoardsFromSupabase() {
                 });
             }
         }
-        console.log(`[office] hydrate: ${officeBoards.size} offices`);
+        if (Array.isArray(wbNotes)) {
+            for (const row of wbNotes) {
+                const key = row.office_key || 'default';
+                const board = getOfficeBoard(key);
+                board.whiteboards.push({
+                    id: row.id,
+                    author: row.author || '',
+                    color: row.color || 0,
+                    text: row.body || ''
+                });
+            }
+        }
+        if (Array.isArray(wbStrokes)) {
+            for (const row of wbStrokes) {
+                const key = row.office_key || 'default';
+                const board = getOfficeBoard(key);
+                board.whiteboardStrokes.push({
+                    id: row.id,
+                    author: row.author || '',
+                    color: row.color || 0,
+                    points: row.points || ''
+                });
+            }
+        }
+        let notes = 0;
+        let strokes = 0;
+        for (const b of officeBoards.values()) {
+            notes += (b.whiteboards || []).length;
+            strokes += (b.whiteboardStrokes || []).length;
+        }
+        console.log(`[office] hydrate: ${officeBoards.size} offices, wb notes=${notes} strokes=${strokes}`);
     } catch (e) {
         console.error('[office] hydrate failed:', e.message || e);
     }
@@ -267,20 +344,56 @@ async function persistOfficeReport(officeKey, rep) {
     });
 }
 
+async function persistWbNote(officeKey, note) {
+    if (!SUPABASE_READY || !note || !note.id) return;
+    await sbFetch('office_wb_notes', {
+        method: 'POST',
+        headers: sbHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify({
+            office_key: officeKey,
+            id: note.id,
+            author: note.author || '',
+            color: note.color || 0,
+            body: note.text || '',
+            updated_unix: Math.floor(Date.now() / 1000)
+        })
+    });
+}
+
+async function deleteWbNote(officeKey, noteId) {
+    if (!SUPABASE_READY || !noteId) return;
+    const path = 'office_wb_notes?office_key=eq.' + encodeURIComponent(officeKey)
+        + '&id=eq.' + encodeURIComponent(noteId);
+    await sbFetch(path, { method: 'DELETE', headers: sbHeaders() });
+}
+
+async function persistWbStroke(officeKey, stroke) {
+    if (!SUPABASE_READY || !stroke || !stroke.id) return;
+    await sbFetch('office_wb_strokes', {
+        method: 'POST',
+        headers: sbHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify({
+            office_key: officeKey,
+            id: stroke.id,
+            author: stroke.author || '',
+            color: stroke.color || 0,
+            points: stroke.points || '',
+            updated_unix: Math.floor(Date.now() / 1000)
+        })
+    });
+}
+
+async function deleteWbStrokesByAuthor(officeKey, author) {
+    if (!SUPABASE_READY || !author) return;
+    const path = 'office_wb_strokes?office_key=eq.' + encodeURIComponent(officeKey)
+        + '&author=eq.' + encodeURIComponent(author);
+    await sbFetch(path, { method: 'DELETE', headers: sbHeaders() });
+}
+
 function sendOfficeSnapshot(ws, officeKey, roomId) {
     if (!ws || ws.readyState !== WebSocket.OPEN || !officeKey) return;
     const board = getOfficeBoard(officeKey);
-    ws.send(JSON.stringify({
-        type: 'office_snapshot',
-        officeKey,
-        roomId: roomId || '',
-        cards: board.cards,
-        reports: board.reports,
-        whiteboards: {
-            notes: board.whiteboards || [],
-            strokes: board.whiteboardStrokes || []
-        }
-    }));
+    ws.send(JSON.stringify(buildOfficeSnapshot(officeKey, roomId, board)));
 }
 
 function applyOfficeSignal(player, text) {
@@ -366,53 +479,27 @@ function applyOfficeSignal(player, text) {
     }
 
     if (parts[0] === 'wb') {
-        if (!board.whiteboards) board.whiteboards = [];
-        if (!board.whiteboardStrokes) board.whiteboardStrokes = [];
         const op = (parts[1] || '').toLowerCase();
-        if (op === 'add' && parts.length >= 6) {
-            const note = {
-                id: parts[2],
-                author: parts[3] || '',
-                color: parseInt(parts[4], 10) || 0,
-                text: parts.slice(5).join('|').slice(0, 180)
-            };
-            const idx = board.whiteboards.findIndex(n => n.id === note.id);
-            if (idx >= 0) board.whiteboards[idx] = note;
-            else board.whiteboards.push(note);
-            if (board.whiteboards.length > 100) board.whiteboards = board.whiteboards.slice(-100);
-            return true;
-        }
-        if (op === 'del' && parts.length >= 3) {
-            const id = parts[2];
-            board.whiteboards = board.whiteboards.filter(n => n.id !== id);
-            return true;
-        }
-        if (op === 'stroke' && parts.length >= 6) {
-            const packed = String(parts[5] || '').replace(/[^0-9]/g, '').slice(0, 112);
-            if (packed.length < 8) return true;
-            const stroke = {
-                id: parts[2],
-                author: parts[3] || '',
-                color: Math.max(0, Math.min(5, parseInt(parts[4], 10) || 0)),
-                points: packed
-            };
-            const idx = board.whiteboardStrokes.findIndex(s => s.id === stroke.id);
-            if (idx >= 0) board.whiteboardStrokes[idx] = stroke;
-            else board.whiteboardStrokes.push(stroke);
-            if (board.whiteboardStrokes.length > 80)
-                board.whiteboardStrokes = board.whiteboardStrokes.slice(-80);
-            return true;
-        }
-        if (op === 'strokeclear' && parts.length >= 3) {
-            const author = (parts[2] || '').toLowerCase();
-            board.whiteboardStrokes = board.whiteboardStrokes.filter(
-                s => (s.author || '').toLowerCase() !== author);
-            return true;
-        }
         if (op === 'hello') {
             sendOfficeSnapshot(player._ws || null, officeKey, player.roomId);
             return true;
         }
+        const result = applyWbSignal(board, parts);
+        if (!result.ok) return false;
+        if (result.op === 'add' && result.note) {
+            persistWbNote(officeKey, result.note).catch(e =>
+                console.error('[office] persist wb note:', e.message || e));
+        } else if (result.op === 'del' && result.id) {
+            deleteWbNote(officeKey, result.id).catch(e =>
+                console.error('[office] delete wb note:', e.message || e));
+        } else if (result.op === 'stroke' && result.stroke) {
+            persistWbStroke(officeKey, result.stroke).catch(e =>
+                console.error('[office] persist wb stroke:', e.message || e));
+        } else if (result.op === 'strokeclear' && result.author) {
+            deleteWbStrokesByAuthor(officeKey, result.author).catch(e =>
+                console.error('[office] delete wb strokes:', e.message || e));
+        }
+        return true;
     }
     return false;
 }
@@ -466,6 +553,7 @@ wss.on('connection', (ws) => {
                 case "request_join": handleRequestJoin(ws, player, data); break;
                 case "approve_join": handleApproveJoin(ws, player, data); break;
                 case "chat":         handleChat(ws, player, data); break;
+                case "react":        handleReact(ws, player, data); break;
                 case "move":
                     player.x = typeof data.x === "number" ? data.x : (data.x || 0);
                     player.y = typeof data.y === "number" ? data.y : (data.y || 0);
@@ -585,10 +673,38 @@ function handleChat(ws, player, data) {
     if (text.startsWith('__near|'))
         applyOfficeSignal(player, text);
 
-    const msg = { type: "chat", name: player.name, text: text, roomId: roomId };
+    const threadId = typeof data.threadId === 'string' ? data.threadId.slice(0, 96) : '';
+    const msgId = `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const msg = {
+        type: "chat",
+        name: player.name,
+        text: text,
+        roomId: roomId,
+        msgId,
+        threadId
+    };
     clients.forEach(client => {
         if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
             client.ws.send(JSON.stringify(msg));
+        }
+    });
+}
+
+/** Places-as-Channels: emoji toast fan-out (same room only). */
+function handleReact(ws, player, data) {
+    const roomId = player.roomId || "global";
+    const emoji = typeof data.emoji === 'string' ? data.emoji.slice(0, 8) : '+1';
+    const targetName = typeof data.targetName === 'string' ? data.targetName.slice(0, 32) : '';
+    const msg = JSON.stringify({
+        type: "react",
+        name: player.name,
+        emoji,
+        targetName,
+        roomId
+    });
+    clients.forEach(client => {
+        if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(msg);
         }
     });
 }
@@ -761,26 +877,26 @@ function isFriendOf(targetPlayer, senderName) {
 function handleDmSend(ws, player, data) {
     const text = (typeof data.text === "string" ? data.text : "").trim().slice(0, 1000);
     if (!text) {
-        ws.send(JSON.stringify({ type: "dm_error", message: "Пустое сообщение" }));
+        ws.send(JSON.stringify({ type: "dm_error", message: "Empty message" }));
         return;
     }
     const target = findClientByIdOrName(data.toId, data.toName);
     if (!target) {
-        ws.send(JSON.stringify({ type: "dm_error", message: "Игрок не в сети" }));
+        ws.send(JSON.stringify({ type: "dm_error", message: "Player is offline" }));
         return;
     }
     if (target.player.id === player.id) {
-        ws.send(JSON.stringify({ type: "dm_error", message: "Нельзя писать себе" }));
+        ws.send(JSON.stringify({ type: "dm_error", message: "Cannot message yourself" }));
         return;
     }
 
     const policy = target.player.whoCanMessage || "everyone";
     if (policy === "nobody") {
-        ws.send(JSON.stringify({ type: "dm_error", message: "Личка закрыта" }));
+        ws.send(JSON.stringify({ type: "dm_error", message: "DMs closed" }));
         return;
     }
     if (policy === "friends" && !isFriendOf(target.player, player.name)) {
-        ws.send(JSON.stringify({ type: "dm_error", message: "Писать могут только друзья" }));
+        ws.send(JSON.stringify({ type: "dm_error", message: "Friends only" }));
         return;
     }
 
@@ -799,10 +915,11 @@ function handleDmSend(ws, player, data) {
     console.log(`[dm] ${player.name} → ${target.player.name}: ${text.slice(0, 40)}`);
 }
 
-function broadcastPlayersUpdate() {
+function broadcastPlayersUpdate(force) {
     const playersData = clients.map(c => ({
         id: c.player.id,
         name: c.player.name,
+        roomId: c.player.roomId || 'global',
         x: c.player.x || 0,
         y: c.player.y || 0,
         speed: typeof c.player.speed === "number" ? c.player.speed : 0,
@@ -810,20 +927,41 @@ function broadcastPlayersUpdate() {
         falling: !!c.player.falling,
         skin: typeof c.player.skin === "string" && c.player.skin ? c.player.skin : "manny"
     }));
-    const msg = JSON.stringify({ type: "update", players: playersData });
+    const fp = playersUpdateFingerprint(playersData);
+    if (!force && fp === lastPlayersFingerprint) {
+        updateBroadcastsSkipped++;
+        return;
+    }
+    lastPlayersFingerprint = fp;
+    updateBroadcastsSent++;
+
+    // Room-scoped fanout: each client gets global+own room peers (city/office split).
+    const byRoom = new Map();
+    for (const p of playersData) {
+        const rid = p.roomId || 'global';
+        if (!byRoom.has(rid)) byRoom.set(rid, []);
+        byRoom.get(rid).push(p);
+    }
+
     clients.forEach(client => {
-        if (client.ws.readyState === WebSocket.OPEN) client.ws.send(msg);
+        if (client.ws.readyState !== WebSocket.OPEN) return;
+        const rid = client.player.roomId || 'global';
+        // Always include global players when in office so city presence stays visible optionally —
+        // for bandwidth: only same room.
+        const list = byRoom.get(rid) || [];
+        client.ws.send(JSON.stringify({ type: 'update', players: list }));
     });
 }
 
-setInterval(broadcastPlayersUpdate, 150);
+setInterval(() => broadcastPlayersUpdate(false), 150);
 
 Promise.all([
     hydrateBulletinFromSupabase(),
     hydrateOfficeBoardsFromSupabase()
 ]).finally(() => {
     server.listen(PORT, () => {
-        console.log(`NEAR Server запущен на порту ${PORT}` +
-            (SUPABASE_READY ? ' (bulletin+office→Supabase)' : ' (RAM only)'));
+        console.log(`NEAR Server on :${PORT}` +
+            (SUPABASE_READY ? ' (bulletin+office+wb→Supabase)' : ' (RAM only)') +
+            ' | GET /health');
     });
 });

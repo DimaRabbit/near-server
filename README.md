@@ -3,6 +3,16 @@
 Код WebSocket-сервера NEAR. В проде крутится на **Render**:  
 https://near-server.onrender.com/
 
+## Tests
+
+```powershell
+npm test
+# or
+node --test test/office-whiteboard.test.js
+```
+
+From NEAR client tree: `Tools\verify_near.ps1` (tests + English UI guard + optional editor build).
+
 ## Use Cloud Server.bat
 
 Один раз (или после смены хоста):
@@ -26,6 +36,11 @@ https://near-server.onrender.com/
 Схемы (Supabase SQL Editor, по порядку):
 1. [`sql/bulletin.sql`](sql/bulletin.sql) — городская доска
 2. [`sql/office_board.sql`](sql/office_board.sql) — Kanban + итоги дня (ключ = имя офиса)
+3. [`sql/office_whiteboard.sql`](sql/office_whiteboard.sql) — whiteboard notes + strokes
+
+Health: `GET https://near-server.onrender.com/health` → JSON (clients, offices, broadcast skip stats).
+
+Presence: room-scoped `update` fanout + dirty-check skip when pose unchanged (saves bandwidth).
 
 ## Деплой checklist (инвестор-демо)
 
