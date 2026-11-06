@@ -519,6 +519,7 @@ wss.on('connection', (ws) => {
         yaw: 0,
         falling: false,
         skin: "manny",
+        work: "", // live work status under nameplate
         whoCanMessage: "everyone", // everyone | friends | nobody
         friendNames: []
     };
@@ -580,6 +581,12 @@ wss.on('connection', (ws) => {
                 case "set_skin":
                     if (typeof data.skin === "string" && data.skin.trim()) {
                         player.skin = data.skin.trim().slice(0, 48).toLowerCase();
+                        broadcastPlayersUpdate(true);
+                    }
+                    break;
+                case "set_work_status":
+                    if (typeof data.work === "string") {
+                        player.work = data.work.replace(/[^\x20-\x7E]/g, '').trim().slice(0, 28);
                         broadcastPlayersUpdate(true);
                     }
                     break;
@@ -862,6 +869,10 @@ function handleBulletinReply(ws, player, data) {
     });
 
     const authorClient = clients.find(c => c.player.id === post.authorId);
+    const authorRoom = authorClient
+        ? (authorClient.player.roomId && authorClient.player.roomId !== 'global'
+            ? authorClient.player.roomId : '')
+        : '';
     if (authorClient && authorClient.ws.readyState === WebSocket.OPEN) {
         // Private to author only — never fan reply text into the author's whole room.
         authorClient.ws.send(JSON.stringify({
@@ -870,7 +881,8 @@ function handleBulletinReply(ws, player, data) {
             postTitle: post.title,
             fromName: player.name,
             fromId: player.id,
-            text
+            text,
+            roomId: authorRoom
         }));
         const roomId = authorClient.player.roomId || "global";
         const chatText = `[reply] ${player.name} → "${post.title}": ${text}`.slice(0, 800);
@@ -882,6 +894,17 @@ function handleBulletinReply(ws, player, data) {
             roomId,
             msgId,
             threadId: ''
+        }));
+    }
+    // Hiring funnel: candidate gets one-tap knock CTA if employer is in an office.
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: "hire_cta",
+            postId,
+            postTitle: post.title,
+            authorName: post.authorName || '',
+            authorId: post.authorId,
+            roomId: authorRoom
         }));
     }
     console.log(`[bulletin] reply from ${player.name} on ${postId}`);
@@ -973,7 +996,8 @@ function broadcastPlayersUpdate(force) {
         speed: typeof c.player.speed === "number" ? c.player.speed : 0,
         yaw: typeof c.player.yaw === "number" ? c.player.yaw : 0,
         falling: !!c.player.falling,
-        skin: typeof c.player.skin === "string" && c.player.skin ? c.player.skin : "manny"
+        skin: typeof c.player.skin === "string" && c.player.skin ? c.player.skin : "manny",
+        work: typeof c.player.work === "string" ? c.player.work : ""
     }));
     const fp = playersUpdateFingerprint(playersData);
     if (!force && fp === lastPlayersFingerprint) {
