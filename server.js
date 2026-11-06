@@ -53,7 +53,8 @@ const server = http.createServer((req, res) => {
     res.end('NEAR Server Running');
 });
 
-const wss = new WebSocket.Server({ server });
+// Cap text+binary frames (~voice max 96KB). Default ws maxPayload is ~100MB.
+const wss = new WebSocket.Server({ server, maxPayload: 100000 });
 
 let clients = [];
 let rooms = new Map();
@@ -410,10 +411,11 @@ function applyOfficeSignal(player, text) {
     if (parts[0] === 'board') {
         const op = (parts[1] || '').toLowerCase();
         if ((op === 'add' || op === 'edit') && parts.length >= 7) {
-            const id = parts[2];
+            const id = String(parts[2] || '').slice(0, 64);
+            if (!id) return true;
             const column = ['todo', 'doing', 'done'].includes((parts[3] || '').toLowerCase())
                 ? parts[3].toLowerCase() : 'todo';
-            const author = parts[4] || '';
+            const author = (player.name || parts[4] || '').slice(0, 32);
             let dueDate = '';
             let textIdx = 5;
             const maybeDue = parts[5] || '';
@@ -460,7 +462,7 @@ function applyOfficeSignal(player, text) {
         const op = (parts[1] || '').toLowerCase();
         if (op === 'set' && parts.length >= 5) {
             const dateYmd = parts[2] || '';
-            const author = parts[3] || '';
+            const author = (player.name || parts[3] || '').slice(0, 32);
             const repText = parts.slice(4).join('|').slice(0, 180);
             const rep = { author, dateYmd, text: repText };
             const idx = board.reports.findIndex(r =>
@@ -532,6 +534,8 @@ wss.on('connection', (ws) => {
     ws.on('message', (message, isBinary) => {
         // --- ГОЛОС: бинарный кадр [int32 sampleRate][int16 PCM...] ---
         if (isBinary) {
+            // Cap voice frames (~1s mono 48k int16 + header) to avoid memory/DoS spikes.
+            if (!message || message.length < 4 || message.length > 96000) return;
             const header = Buffer.alloc(4);
             header.writeInt32LE(player.id, 0);
             const out = Buffer.concat([header, message]);
@@ -554,9 +558,11 @@ wss.on('connection', (ws) => {
                 case "approve_join": handleApproveJoin(ws, player, data); break;
                 case "chat":         handleChat(ws, player, data); break;
                 case "react":        handleReact(ws, player, data); break;
-                case "move":
-                    player.x = typeof data.x === "number" ? data.x : (data.x || 0);
-                    player.y = typeof data.y === "number" ? data.y : (data.y || 0);
+                case "move": {
+                    const nx = Number(data.x);
+                    const ny = Number(data.y);
+                    if (Number.isFinite(nx)) player.x = Math.max(-50000, Math.min(50000, nx));
+                    if (Number.isFinite(ny)) player.y = Math.max(-50000, Math.min(50000, ny));
                     if (typeof data.speed === "number" && Number.isFinite(data.speed))
                         player.speed = Math.max(0, Math.min(1200, data.speed));
                     if (typeof data.yaw === "number" && Number.isFinite(data.yaw))
@@ -564,16 +570,17 @@ wss.on('connection', (ws) => {
                     if (typeof data.falling === "boolean")
                         player.falling = data.falling;
                     break;
+                }
                 case "set_name":
                     if (typeof data.name === "string" && data.name.trim()) {
                         player.name = data.name.trim().slice(0, 32);
-                        broadcastPlayersUpdate();
+                        broadcastPlayersUpdate(true);
                     }
                     break;
                 case "set_skin":
                     if (typeof data.skin === "string" && data.skin.trim()) {
                         player.skin = data.skin.trim().slice(0, 48).toLowerCase();
-                        broadcastPlayersUpdate();
+                        broadcastPlayersUpdate(true);
                     }
                     break;
                 case "set_privacy":
@@ -604,25 +611,52 @@ wss.on('connection', (ws) => {
         console.log(`[${player.name}] отключился`);
         clients = clients.filter(c => c.ws !== ws);
 
+        const closedRooms = [];
         rooms.forEach((room, roomId) => {
             room.members = room.members.filter(id => id !== player.id);
             if (room.creatorId === player.id) {
                 rooms.delete(roomId);
-                const closeMsg = JSON.stringify({ type: "room_closed", roomId });
-                clients.forEach(c => {
-                    if (c.ws !== ws && c.ws.readyState === WebSocket.OPEN) c.ws.send(closeMsg);
-                });
+                closedRooms.push(roomId);
             }
         });
 
-        broadcastPlayersUpdate();
+        // Creator gone → kick remaining members out of the ghost roomId.
+        for (const roomId of closedRooms) {
+            clients.forEach(c => {
+                if (c.player.roomId === roomId)
+                    c.player.roomId = 'global';
+            });
+            const closeMsg = JSON.stringify({ type: "room_closed", roomId });
+            clients.forEach(c => {
+                if (c.ws.readyState === WebSocket.OPEN) c.ws.send(closeMsg);
+            });
+        }
+
+        broadcastPlayersUpdate(true);
     });
 });
 
 // ====================== ОБРАБОТЧИКИ ======================
 
+/** Drop membership in previous office before assigning a new roomId. */
+function leaveCurrentRoom(player) {
+    const rid = player.roomId;
+    if (!rid || rid === 'global') {
+        player.roomId = 'global';
+        return;
+    }
+    const room = rooms.get(rid);
+    if (room) {
+        room.members = (room.members || []).filter(id => id !== player.id);
+        // If creator abandons without disconnect, keep room alive until close —
+        // only membership is cleared here.
+    }
+    player.roomId = 'global';
+}
+
 function handleCreateRoom(ws, player, data) {
-    const roomId = "room_" + Date.now();
+    leaveCurrentRoom(player);
+    const roomId = "room_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
     const roomName = data.name || "Private Room";
     const officeKey = officeKeyFromRoomName(roomName);
     rooms.set(roomId, {
@@ -637,6 +671,7 @@ function handleCreateRoom(ws, player, data) {
     sendOfficeSnapshot(ws, officeKey, roomId);
     console.log(`[${player.name}] создал комнату ${roomId} (office=${officeKey})`);
     broadcastRoomAvailable(roomId);
+    broadcastPlayersUpdate(true);
 }
 
 function handleRequestJoin(ws, player, data) {
@@ -653,25 +688,39 @@ function handleRequestJoin(ws, player, data) {
 function handleApproveJoin(ws, player, data) {
     const room = rooms.get(data.roomId);
     if (!room || room.creatorId !== player.id) return;
-    const targetId = parseInt(data.userId);
+    const targetId = parseInt(data.userId, 10);
+    if (!Number.isFinite(targetId)) return;
     if (!!data.approved) {
-        if (!room.members.includes(targetId)) room.members.push(targetId);
         const targetClient = clients.find(c => c.player.id === targetId);
         if (targetClient) {
+            leaveCurrentRoom(targetClient.player);
             targetClient.player.roomId = data.roomId;
+            if (!room.members.includes(targetId)) room.members.push(targetId);
             targetClient.ws.send(JSON.stringify({ type: "join_approved", roomId: data.roomId }));
             if (room.officeKey)
                 sendOfficeSnapshot(targetClient.ws, room.officeKey, data.roomId);
+            broadcastPlayersUpdate(true);
         }
     }
 }
 
+function isOfficeHelloSignal(text) {
+    return /^__near\|(board|wb|report)\|hello(?:\||$)/i.test(text || '');
+}
+
 function handleChat(ws, player, data) {
     const roomId = player.roomId || "global";
-    const text = typeof data.text === 'string' ? data.text : '';
-    // Kanban / day report: обновить server+Supabase до fan-out (hello → snapshot).
-    if (text.startsWith('__near|'))
+    let text = typeof data.text === 'string' ? data.text : '';
+    const bOfficeSignal = text.startsWith('__near|');
+    // Human chat capped tighter; office protocol (__near|) needs a bit more headroom.
+    const maxLen = bOfficeSignal ? 2000 : 800;
+    if (text.length > maxLen) text = text.slice(0, maxLen);
+    // Kanban / day report: apply before fan-out. hello → snapshot only (no room storm).
+    if (bOfficeSignal)
         applyOfficeSignal(player, text);
+    if (!text) return;
+    if (isOfficeHelloSignal(text))
+        return;
 
     const threadId = typeof data.threadId === 'string' ? data.threadId.slice(0, 96) : '';
     const msgId = `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -681,7 +730,7 @@ function handleChat(ws, player, data) {
         text: text,
         roomId: roomId,
         msgId,
-        threadId
+        threadId: bOfficeSignal ? '' : threadId
     };
     clients.forEach(client => {
         if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
@@ -814,6 +863,7 @@ function handleBulletinReply(ws, player, data) {
 
     const authorClient = clients.find(c => c.player.id === post.authorId);
     if (authorClient && authorClient.ws.readyState === WebSocket.OPEN) {
+        // Private to author only — never fan reply text into the author's whole room.
         authorClient.ws.send(JSON.stringify({
             type: "bulletin_reply_notify",
             postId,
@@ -822,19 +872,17 @@ function handleBulletinReply(ws, player, data) {
             fromId: player.id,
             text
         }));
-        // Дублируем в чат автора (его текущая room), чтобы было видно в ленте.
         const roomId = authorClient.player.roomId || "global";
-        const chatText = `[отклик] ${player.name} → «${post.title}»: ${text}`;
-        clients.forEach(client => {
-            if (client.player.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
-                client.ws.send(JSON.stringify({
-                    type: "chat",
-                    name: "Доска",
-                    text: chatText,
-                    roomId
-                }));
-            }
-        });
+        const chatText = `[reply] ${player.name} → "${post.title}": ${text}`.slice(0, 800);
+        const msgId = `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        authorClient.ws.send(JSON.stringify({
+            type: "chat",
+            name: "Board",
+            text: chatText,
+            roomId,
+            msgId,
+            threadId: ''
+        }));
     }
     console.log(`[bulletin] reply from ${player.name} on ${postId}`);
 }
@@ -935,7 +983,7 @@ function broadcastPlayersUpdate(force) {
     lastPlayersFingerprint = fp;
     updateBroadcastsSent++;
 
-    // Room-scoped fanout: each client gets global+own room peers (city/office split).
+    // Room-scoped fanout: each client gets ONLY same-room peers (city vs office isolation).
     const byRoom = new Map();
     for (const p of playersData) {
         const rid = p.roomId || 'global';
@@ -946,8 +994,6 @@ function broadcastPlayersUpdate(force) {
     clients.forEach(client => {
         if (client.ws.readyState !== WebSocket.OPEN) return;
         const rid = client.player.roomId || 'global';
-        // Always include global players when in office so city presence stays visible optionally —
-        // for bandwidth: only same room.
         const list = byRoom.get(rid) || [];
         client.ws.send(JSON.stringify({ type: 'update', players: list }));
     });

@@ -1,5 +1,5 @@
--- NEAR office whiteboard notes + freehand strokes (persist across Render restarts)
--- Run in Supabase SQL Editor after office_board.sql
+/* NEAR office whiteboard notes + freehand strokes (persist across Render restarts)
+   Run in Supabase SQL Editor after office_board.sql */
 
 create table if not exists public.office_wb_notes (
   office_key text not null,

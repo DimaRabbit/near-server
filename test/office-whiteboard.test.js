@@ -99,15 +99,25 @@ describe('office_snapshot shape', () => {
 describe('presence fingerprint (replication skip)', () => {
     it('stable when pose unchanged, changes on move', () => {
         const a = [
-            { id: 1, x: 10, y: 20, yaw: 1.5, speed: 0, falling: false, skin: 'manny' }
+            { id: 1, roomId: 'global', x: 10, y: 20, yaw: 1.5, speed: 0, falling: false, skin: 'manny' }
         ];
         const b = [
-            { id: 1, x: 10, y: 20, yaw: 1.5, speed: 0, falling: false, skin: 'manny' }
+            { id: 1, roomId: 'global', x: 10, y: 20, yaw: 1.5, speed: 0, falling: false, skin: 'manny' }
         ];
         const c = [
-            { id: 1, x: 11, y: 20, yaw: 1.5, speed: 0, falling: false, skin: 'manny' }
+            { id: 1, roomId: 'global', x: 11, y: 20, yaw: 1.5, speed: 0, falling: false, skin: 'manny' }
         ];
         assert.equal(playersUpdateFingerprint(a), playersUpdateFingerprint(b));
         assert.notEqual(playersUpdateFingerprint(a), playersUpdateFingerprint(c));
+    });
+
+    it('changes when roomId changes without move (office join)', () => {
+        const street = [
+            { id: 1, roomId: 'global', x: 10, y: 20, yaw: 0, speed: 0, falling: false, skin: 'manny' }
+        ];
+        const office = [
+            { id: 1, roomId: 'room_1', x: 10, y: 20, yaw: 0, speed: 0, falling: false, skin: 'manny' }
+        ];
+        assert.notEqual(playersUpdateFingerprint(street), playersUpdateFingerprint(office));
     });
 });
